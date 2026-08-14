@@ -4,12 +4,14 @@ Android home assignment: a custom image downloading/caching library plus a sampl
 
 The library is written from scratch — no Glide, Coil, Picasso or Fresco, and no Retrofit/OkHttp either. Downloading is `HttpURLConnection`, decoding is `BitmapFactory`. The sample app uses Android Views/XML (no Jetpack Compose) and MVVM.
 
-> **Status — image-loader complete (MR #4).**
+> **Status — image-loader complete (MR #4); app data layer and ViewModel complete (MR #5).**
 > The library downloads, decodes and displays remote images with placeholder support, per-target
 > request protection, a bounded memory cache, a persistent disk cache, four-hour expiry, manual
 > invalidation, and shared in-flight requests so concurrent loads of the same uncached URL perform
-> one download between them. The image list screen is still to come — the sample app currently
-> shows only the starter layout.
+> one download between them. The sample app fetches and parses the supplied image list and exposes
+> it as lifecycle-friendly MVVM state. The list screen itself is still to come — there is no
+> RecyclerView, no row layout and no cache-invalidation button yet, and `MainActivity` still shows
+> the starter layout.
 
 ## Modules
 
@@ -156,23 +158,69 @@ Caching is best effort. A write that fails is swallowed and the image is still d
 
 **Invalidation.** `clearCache()` and `invalidate(url)` empty memory and bump a generation counter synchronously — the cache is logically empty the moment the call returns — while the file deletion runs on the disk dispatcher. A load already in flight when the cache was invalidated still displays its image but is refused when it tries to store it, so it cannot resurrect what was just dropped. All disk work is serialised on a single-threaded dispatcher, so a deletion queued by an invalidation always completes before a read queued after it.
 
-## Architecture
+## Sample app data flow
 
-The sample app follows MVVM:
+The app follows MVVM, and nothing above the repository knows how the list arrives:
 
 ```text
-Activity / Fragment  (Android Views, ViewBinding)
-        ↓ observes
-    ViewModel
+MainActivity                       (Android Views + ViewBinding; bound in a later MR)
+        ↓ collects StateFlow<ImagesUiState>
+ImagesViewModel                    (viewModelScope, no Context, no View)
         ↓
-    Repository
+ImagesRepository                   (DefaultImagesRepository)
         ↓
-  Remote Data Source
+ImagesRemoteDataSource             (HttpImagesRemoteDataSource)
+        ↓
+GET image_list.json                (HttpURLConnection on Dispatchers.IO)
 ```
 
-`:app` sources live under `com.rounds.test.app`, split by layer — `presentation.ui` and the `RoundsApplication` composition root today; `data.remote`, `data.repository`, `presentation.model`, `presentation.viewmodel` are added by the merge requests that populate them.
+**The endpoint.** `https://zipoapps-storage-test.nyc3.digitaloceanspaces.com/image_list.json`, declared in one place — `HttpImagesRemoteDataSource`. It returns a bare JSON array whose records carry exactly two fields:
 
-Dependency composition is **manual** — no Hilt, Dagger or Koin. `RoundsApplication` creates the single `ImageLoader` and hands it to whatever needs it.
+```json
+[ { "id": 0, "imageUrl": "https://…/17_4691_….jpg" } ]
+```
+
+The field is `imageUrl`, the `id` is an integer, and the payload was inspected rather than assumed. Records are kept in the order the endpoint supplied them and duplicates are kept as-is: the live payload repeats several `imageUrl` values under different ids, so list identity has to come from `id`.
+
+**Networking.** One GET does not justify Retrofit or OkHttp, so the data source uses `HttpURLConnection` directly: explicit connect/read timeouts, a checked status code, `use`-closed streams and a `disconnect()` in `finally`. The request *and* the parse both run inside `withContext(Dispatchers.IO)`, so nothing here can touch the main thread. It does not reuse the library's `HttpImageDownloader` — that class is internal to `:imageloader` and fetches image bytes; coupling the two modules through their networking internals would trade a real boundary for a few saved lines.
+
+**Parsing** is a separate, pure `ImageListJsonParser` over the platform's `org.json` classes — no serialization stack, no reflection, and directly unit-testable without a server. A record missing `id` or `imageUrl`, or carrying one of the wrong type, **fails the whole response** rather than being skipped or defaulted. `id = 0` is a real record in this payload, so inventing `id = 0` or `imageUrl = ""` would be indistinguishable from real data, and silently dropping records would render a short list that looks complete. Either the response parses, or the screen says so.
+
+**UI state.** The ViewModel exposes an immutable `StateFlow<ImagesUiState>`; the mutable one stays private.
+
+| State | Meaning |
+|---|---|
+| `Loading` | a fetch is in flight — also the initial state |
+| `Content(items)` | at least one record, in endpoint order |
+| `Empty` | the fetch succeeded and returned nothing; not an error |
+| `Error(message)` | the fetch failed; a fixed presentation-safe phrase, never exception text |
+
+Construction starts a fetch immediately: `Loading` → `Content` / `Empty` / `Error`. The state never stays at `Loading` after a failure.
+
+**Reload and cancellation.** `reload()` cancels the fetch still in flight and starts a new one — latest request wins, the same rule the loader applies per target. The state moves to `Loading` synchronously before the new fetch begins, and a superseded fetch is barred from publishing its result, so a slow first request cannot overwrite a newer one whatever the completion order. `CancellationException` is rethrown rather than caught: a replaced request, or a cleared `viewModelScope`, is normal shutdown and must never be shown to the user as a failure.
+
+## Architecture
+
+`:app` sources live under `com.rounds.test.app`, split by layer:
+
+```text
+com.rounds.test.app
+├── RoundsApplication         composition root
+├── data/
+│   ├── remote/               ImagesRemoteDataSource, HttpImagesRemoteDataSource
+│   │   └── parser/           ImageListJsonParser
+│   └── repository/           ImagesRepository, DefaultImagesRepository
+└── presentation/
+    ├── model/                ImageItem
+    ├── ui/                   MainActivity
+    └── viewmodel/            ImagesUiState, ImagesViewModel
+```
+
+Nothing in `:app` is exported, so every type in it except `RoundsApplication` and the Activity is `internal`.
+
+There is one model, not a DTO plus a domain class plus a mapper: the endpoint's two fields are exactly the two the screen shows, and an identical second class would add indirection and no meaning. There is no use case or interactor above the repository either — the repository *is* the boundary the ViewModel is written and tested against.
+
+Dependency composition is **manual** — no Hilt, Dagger or Koin. `RoundsApplication` creates the single `ImageLoader` and the single `ImagesRepository` and hands them to whatever needs them. The ViewModel is built from `ImagesViewModel.factory(repository)`, a `viewModelFactory { … }` on the ViewModel's companion rather than a class of its own.
 
 `:imageloader` internals:
 
@@ -204,9 +252,17 @@ Requires the Android SDK (`local.properties` → `sdk.dir`). Toolchain: AGP 9.3.
 ```powershell
 .\gradlew.bat test                          # JVM unit tests (all modules)
 .\gradlew.bat :imageloader:testDebugUnitTest  # image-loader tests only
+.\gradlew.bat :app:testDebugUnitTest        # sample app tests only
 .\gradlew.bat lint                          # Android Lint
 .\gradlew.bat connectedAndroidTest          # instrumented tests (needs a device/emulator)
 ```
+
+The app tests never touch the production endpoint:
+
+- `ImageListJsonParser` is driven by literal JSON fixtures — endpoint order, repeated urls, an empty array, unknown fields, and every way a required field can be absent or the wrong type, including one bad record among good ones;
+- `HttpImagesRemoteDataSource` runs against a JDK `HttpServer` on an ephemeral loopback port, the same pattern the library's downloader tests use rather than a second networking-test philosophy: valid JSON, an empty list, a malformed body, an empty body, 404, 500, an unreachable port, and that the request really is a GET;
+- `ImagesViewModel` runs on a `StandardTestDispatcher` installed as the main dispatcher, with a fake repository whose every call is released by hand — so `Loading → Content`, `Loading → Empty`, `Loading → Error`, retry-after-error, "a superseded fetch cannot overwrite a newer one" and "cancellation is not an error" are all decided by the test, with no delays and nothing timing-sensitive;
+- `org.json` inside `android.jar` is a stub that throws, so the reference implementation is on the unit-test classpath only; production uses the platform class.
 
 The image-loader tests are deterministic and offline:
 
