@@ -1,5 +1,6 @@
 package com.rounds.imageloader
 
+import android.content.Context
 import android.widget.ImageView
 import androidx.annotation.DrawableRes
 import com.rounds.imageloader.internal.RealImageLoader
@@ -9,6 +10,8 @@ import com.rounds.imageloader.internal.RealImageLoader
  *
  * The API is deliberately small and blocking-free: [load] returns immediately, the placeholder is
  * applied before it returns, and the decoded image is delivered to the target on the main thread.
+ * Images are served from a bounded memory cache, then a disk cache, then the network, and stay
+ * valid for four hours.
  * Coroutines are an implementation detail — consumers never supply a scope, a dispatcher or a
  * suspending function, which keeps the library equally usable from Java and Kotlin.
  *
@@ -43,8 +46,27 @@ interface ImageLoader {
     /**
      * Cancels the request currently associated with [target], if any, and prevents its result from
      * being applied. Safe to call for a target that has no pending request.
+     *
+     * This is view lifecycle, not storage: it discards work for one `ImageView` and leaves cached
+     * images alone. To discard cached images use [clearCache] or [invalidate].
      */
     fun clear(target: ImageView)
+
+    /**
+     * Removes every cached image from both memory and disk.
+     *
+     * The cache is logically empty as soon as this returns — a load started afterwards will not be
+     * served an old image — while the file deletion completes in the background. A load that was
+     * already in flight when this was called cannot repopulate the cache with what it downloaded
+     * before the invalidation.
+     */
+    fun clearCache()
+
+    /**
+     * Removes the cached image for [url] from both memory and disk, leaving every other entry in
+     * place. Same immediacy and same in-flight guarantee as [clearCache].
+     */
+    fun invalidate(url: String)
 
     companion object {
 
@@ -54,8 +76,13 @@ interface ImageLoader {
          */
         const val NO_PLACEHOLDER: Int = 0
 
-        /** Creates an [ImageLoader] backed by `HttpURLConnection` and `BitmapFactory`. */
+        /**
+         * Creates an [ImageLoader] backed by `HttpURLConnection`, `BitmapFactory`, a bounded memory
+         * cache and a disk cache under the application's cache directory.
+         *
+         * Only `context.applicationContext` is retained, so passing an Activity here is safe.
+         */
         @JvmStatic
-        fun create(): ImageLoader = RealImageLoader()
+        fun create(context: Context): ImageLoader = RealImageLoader.create(context)
     }
 }
