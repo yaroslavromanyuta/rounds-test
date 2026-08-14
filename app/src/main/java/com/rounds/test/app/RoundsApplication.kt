@@ -12,5 +12,5 @@ import com.rounds.imageloader.ImageLoader
  */
 class RoundsApplication : Application() {
 
-    val imageLoader: ImageLoader by lazy { ImageLoader.create() }
+    val imageLoader: ImageLoader by lazy { ImageLoader.create(this) }
 }

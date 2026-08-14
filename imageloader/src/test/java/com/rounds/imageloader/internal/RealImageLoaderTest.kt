@@ -3,9 +3,11 @@ package com.rounds.imageloader.internal
 import android.graphics.Bitmap
 import com.rounds.imageloader.ImageLoader
 import com.rounds.imageloader.request.TargetRequest
+import com.rounds.imageloader.testing.FakeClock
 import com.rounds.imageloader.testing.FakeImageDecoder
 import com.rounds.imageloader.testing.FakeImageDownloader
 import com.rounds.imageloader.testing.FakeTarget
+import com.rounds.imageloader.testing.testImageCache
 import java.io.IOException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -14,7 +16,9 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import org.mockito.Mockito.mock
 
 /**
@@ -27,17 +31,26 @@ import org.mockito.Mockito.mock
 @OptIn(ExperimentalCoroutinesApi::class)
 class RealImageLoaderTest {
 
+    @get:Rule
+    val temporaryFolder = TemporaryFolder()
+
     private val dispatcher = StandardTestDispatcher()
     private val downloader = FakeImageDownloader()
     private val decoder = FakeImageDecoder()
     private val target = FakeTarget()
+    private val clock = FakeClock()
 
-    private val loader = RealImageLoader(
-        downloader = downloader,
-        decoder = decoder,
-        ioDispatcher = dispatcher,
-        mainDispatcher = dispatcher,
-    )
+    // An empty cache over a fresh temporary directory: every load here exercises the network path.
+    private val loader by lazy {
+        RealImageLoader(
+            cache = testImageCache(temporaryFolder.root, clock, dispatcher),
+            downloader = downloader,
+            decoder = decoder,
+            clock = clock,
+            ioDispatcher = dispatcher,
+            mainDispatcher = dispatcher,
+        )
+    }
 
     @Test
     fun `placeholder is applied before any download starts`() = runTest(dispatcher) {
