@@ -15,8 +15,11 @@ internal class CachedBytes(val bytes: ByteArray, val cachedAtMillis: Long)
 /**
  * Identity of the cache state a request observed when it started. Used to reject writes from
  * requests that were overtaken by an invalidation.
+ *
+ * A `data class` because it is also half of an in-flight request's identity: two loads may share
+ * one download only if they observed the same cache state, which is a value comparison.
  */
-internal class CacheSnapshot(val global: Long, val key: Long)
+internal data class CacheSnapshot(val global: Long, val key: Long)
 
 /**
  * Coordinates the two cache tiers and owns invalidation semantics.
@@ -25,12 +28,13 @@ internal class CacheSnapshot(val global: Long, val key: Long)
  * doing it synchronously means a warm cache paints without a placeholder flicker. Every disk
  * operation is suspending and confined to [diskDispatcher].
  *
- * Two mechanisms keep invalidation deterministic without the shared request registry planned for
- * MR #4:
+ * Two mechanisms keep invalidation deterministic against loads that are already running:
  *
  * 1. **Generations.** A request takes a [snapshot] when it starts and passes it back when storing.
  *    `clearCache()` bumps the global generation and `invalidate(url)` bumps that URL's, so a
- *    request that was already in flight when the cache was invalidated cannot repopulate it.
+ *    request that was already in flight when the cache was invalidated cannot repopulate it. The
+ *    same snapshot identifies shared in-flight work, so a load started after an invalidation
+ *    cannot join a load started before it.
  * 2. **A single-threaded disk dispatcher.** Disk work is FIFO, so a deletion queued by an
  *    invalidation always completes before a read queued after it — a pending delete can never let a
  *    stale file be served.
