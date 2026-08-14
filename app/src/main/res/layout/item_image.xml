@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingHorizontal="16dp"
+    android:paddingVertical="8dp">
+
+    <!--
+        A fixed size, because the sources are 1920x1080 wallpapers: letting the row size itself to
+        the bitmap would give every row a different height. centerCrop fills the thumbnail without
+        letterboxing, since both the view and the sources are landscape.
+
+        The thumbnail carries no information the id label does not, so it is marked decorative
+        rather than given a description invented from its filename.
+    -->
+    <ImageView
+        android:id="@+id/image"
+        android:layout_width="96dp"
+        android:layout_height="72dp"
+        android:importantForAccessibility="no"
+        android:scaleType="centerCrop"
+        tools:src="@drawable/image_placeholder" />
+
+    <TextView
+        android:id="@+id/imageId"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:textAppearance="?attr/textAppearanceBodyLarge"
+        tools:text="ID 7" />
+
+</LinearLayout>
