@@ -4,14 +4,14 @@ Android home assignment: a custom image downloading/caching library plus a sampl
 
 The library is written from scratch — no Glide, Coil, Picasso or Fresco, and no Retrofit/OkHttp either. Downloading is `HttpURLConnection`, decoding is `BitmapFactory`. The sample app uses Android Views/XML (no Jetpack Compose) and MVVM.
 
-> **Status — image-loader complete (MR #4); app data layer and ViewModel complete (MR #5).**
+> **Status — functionally complete (MR #6).**
 > The library downloads, decodes and displays remote images with placeholder support, per-target
 > request protection, a bounded memory cache, a persistent disk cache, four-hour expiry, manual
 > invalidation, and shared in-flight requests so concurrent loads of the same uncached URL perform
-> one download between them. The sample app fetches and parses the supplied image list and exposes
-> it as lifecycle-friendly MVVM state. The list screen itself is still to come — there is no
-> RecyclerView, no row layout and no cache-invalidation button yet, and `MainActivity` still shows
-> the starter layout.
+> one download between them. The sample app fetches the supplied image list, renders it in a
+> RecyclerView with each row's image and id, shows a placeholder until each image arrives, and
+> exposes a button that clears the image cache and reloads the visible rows. Remaining work is
+> final test coverage, documentation review and submission polish.
 
 ## Modules
 
@@ -160,11 +160,13 @@ Caching is best effort. A write that fails is swallowed and the image is still d
 
 ## Sample app data flow
 
+The screen is a vertical list of rows, each showing the image the library loaded and the id the endpoint supplied, with a header button that clears the image cache. Android Views and XML throughout — no Compose anywhere in the project.
+
 The app follows MVVM, and nothing above the repository knows how the list arrives:
 
 ```text
-MainActivity                       (Android Views + ViewBinding; bound in a later MR)
-        ↓ collects StateFlow<ImagesUiState>
+MainActivity                       (Android Views + ViewBinding)
+        ↓ collects StateFlow<ImagesUiState> under repeatOnLifecycle(STARTED)
 ImagesViewModel                    (viewModelScope, no Context, no View)
         ↓
 ImagesRepository                   (DefaultImagesRepository)
@@ -172,6 +174,13 @@ ImagesRepository                   (DefaultImagesRepository)
 ImagesRemoteDataSource             (HttpImagesRemoteDataSource)
         ↓
 GET image_list.json                (HttpURLConnection on Dispatchers.IO)
+```
+
+Images travel a completely separate path. The Activity hands the application-scoped loader to the adapter, and the adapter talks to nothing else:
+
+```text
+ImagesAdapter  ──load(url, placeholder, imageView)──▶  ImageLoader  ──▶  memory / disk / network
+               ──clear(imageView) on recycle────────▶
 ```
 
 **The endpoint.** `https://zipoapps-storage-test.nyc3.digitaloceanspaces.com/image_list.json`, declared in one place — `HttpImagesRemoteDataSource`. It returns a bare JSON array whose records carry exactly two fields:
@@ -199,6 +208,20 @@ Construction starts a fetch immediately: `Loading` → `Content` / `Empty` / `Er
 
 **Reload and cancellation.** `reload()` cancels the fetch still in flight and starts a new one — latest request wins, the same rule the loader applies per target. The state moves to `Loading` synchronously before the new fetch begins, and a superseded fetch is barred from publishing its result, so a slow first request cannot overwrite a newer one whatever the completion order. `CancellationException` is rethrown rather than caught: a replaced request, or a cleared `viewModelScope`, is normal shutdown and must never be shown to the user as a failure.
 
+`MainActivity` collects that flow inside `repeatOnLifecycle(STARTED)`, so collection stops when the screen is not visible and resumes with the current value afterwards. `render(state)` is one exhaustive `when`: it shows exactly one of the progress bar, the list, the empty message or the error block, and enables the cache button only while there is content to reload. The Activity keeps no list of its own — the ViewModel's state is the only source of truth, and `ListAdapter` simply holds what it was last given. Rotation therefore costs nothing: the ViewModel survives, the flow replays, and the list comes back without a refetch.
+
+## The list
+
+`ImagesAdapter` is a `ListAdapter` with a `DiffUtil.ItemCallback`, so ordinary updates are diffed rather than blanket-invalidated. **Identity is the `id`, never the url** — the endpoint repeats several urls under different ids, so comparing urls would fold two real rows into one. Contents compare with `==` on the data class.
+
+The adapter is constructed with the application-scoped `ImageLoader` and nothing else: no Activity, ViewModel or repository, so it cannot leak a screen or reach past the library's public API. Binding a row does exactly two things — set the id label, and call `load(item.imageUrl, R.drawable.image_placeholder, imageView)`. There is no HTTP, no `BitmapFactory`, no cache inspection and no second request-token scheme anywhere in `:app`'s UI.
+
+**Recycling.** `onViewRecycled` calls `clear(holder.binding.image)`, which cancels that view's pending request so a scrolled-past download is no longer awaited and a late result can never be painted onto the row's next item. Rebinding relies on the library's own contract: `load` cancels the target's previous request, and every result is checked against the target's current request before it is applied. Fast scrolling is safe because of those two calls, not because of anything the adapter tracks.
+
+**Cache invalidation.** The header button calls `ImageLoader.clearCache()`, then asks the adapter to rebind its rows, then shows a Snackbar. The rebind is what makes the invalidation visible: bitmaps already attached to an `ImageView` would otherwise stay on screen and prove nothing. Every row drops back to its placeholder and loads again. This is the one place `notifyItemRangeChanged` is used — an explicit, user-triggered refresh — and it deliberately does **not** call `viewModel.reload()`: the JSON list did not become stale, only the images did.
+
+**Two kinds of loading, two kinds of failure.** The progress bar means the *list* has not arrived; a row placeholder means that one *image* has not. Once the list is there the screen shows content immediately and each image fills in independently. A failed image leaves its placeholder in place and never turns `Content` into `Error` — the live payload actually contains one such record (id 4's url answers `403`), and the rest of the screen is unaffected by it.
+
 ## Architecture
 
 `:app` sources live under `com.rounds.test.app`, split by layer:
@@ -212,7 +235,7 @@ com.rounds.test.app
 │   └── repository/           ImagesRepository, DefaultImagesRepository
 └── presentation/
     ├── model/                ImageItem
-    ├── ui/                   MainActivity
+    ├── ui/                   MainActivity, ImagesAdapter, ImagesDiffCallback
     └── viewmodel/            ImagesUiState, ImagesViewModel
 ```
 
@@ -262,7 +285,10 @@ The app tests never touch the production endpoint:
 - `ImageListJsonParser` is driven by literal JSON fixtures — endpoint order, repeated urls, an empty array, unknown fields, and every way a required field can be absent or the wrong type, including one bad record among good ones;
 - `HttpImagesRemoteDataSource` runs against a JDK `HttpServer` on an ephemeral loopback port, the same pattern the library's downloader tests use rather than a second networking-test philosophy: valid JSON, an empty list, a malformed body, an empty body, 404, 500, an unreachable port, and that the request really is a GET;
 - `ImagesViewModel` runs on a `StandardTestDispatcher` installed as the main dispatcher, with a fake repository whose every call is released by hand — so `Loading → Content`, `Loading → Empty`, `Loading → Error`, retry-after-error, "a superseded fetch cannot overwrite a newer one" and "cancellation is not an error" are all decided by the test, with no delays and nothing timing-sensitive;
+- `ImagesDiffCallback` is unit-tested on the JVM, because list identity is the one place this payload can catch a reasonable implementation out: two ids sharing one url must stay two rows;
 - `org.json` inside `android.jar` is a stub that throws, so the reference implementation is on the unit-test classpath only; production uses the platform class.
+
+Adapter binding and recycling are not unit-tested. Doing so would mean inflating real views, which is exactly the reason this project avoids Robolectric (see the trade-offs below); they were verified on an emulator instead — startup, placeholder, fast scrolling with no mismatched rows, warm-cache scrolling, cache invalidation and reload, rotation, and error-then-retry with connectivity toggled off and on.
 
 The image-loader tests are deterministic and offline:
 
@@ -282,6 +308,7 @@ The image-loader tests are deterministic and offline:
 - **No disk size limit.** Disk entries are pruned lazily by TTL when encountered, and the four-hour window bounds growth for this use case. A size-capped disk LRU would be the next step in a production library; the memory tier, where an unbounded cache actually crashes an app, *is* bounded.
 - **In-flight deduplication is an engineering decision.** The assignment asks for downloading and caching; sharing one download between concurrent requests for the same URL is our choice, made because a scrolling list produces exactly that pattern.
 - **A shared load may outlive all of its consumers.** If every waiting target is cancelled, the download continues and its result still populates the cache. This deliberately avoids reference-counting subscribers — a fragile mechanism for a small saving — and costs at most one already-started request. Target cancellation still guarantees what actually matters: no cancelled target is ever painted.
+- **Images are decoded at full resolution.** The sources are 1920×1080 wallpapers and the rows show 96×72dp thumbnails, so each decode costs far more memory than the row needs. The memory cache is bounded by heap fraction, so this is safe rather than fatal — measured on an emulator, the app holds ~70MB of native heap with the list scrolling and no `OutOfMemoryError`. Downsampling to the target size is the obvious next step for a production library, but it belongs to the loader, not the screen. For reference, warm-cache scrolling measured 92.9% janky frames at an 85ms median on the emulator, against 100% and 150ms for the device's own launcher on the same run — the emulator's software rendering dominates both.
 - **`Bitmap`/`ImageView` cannot be instantiated on the JVM.** Rather than adding Robolectric, view mutation sits behind a small internal `Target` seam so the interesting logic is plain-JVM testable; Mockito is used only to fabricate a `Bitmap` instance for identity assertions.
 - **Cross-protocol redirects are not followed.** `HttpURLConnection` does not follow an HTTP→HTTPS redirect; such a response is treated as a failure, which is safe rather than surprising.
 - **Cancellation of a request in flight does not interrupt a blocking socket read.** The result is discarded and the connection is closed when the read returns; interrupting the read would add complexity out of proportion to the benefit here.

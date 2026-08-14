@@ -1,3 +1,11 @@
 <resources>
     <string name="app_name">My Application</string>
+
+    <string name="images_title">Images</string>
+    <string name="clear_image_cache">Clear image cache</string>
+    <string name="image_cache_cleared">Image cache cleared</string>
+    <string name="no_images_available">No images available</string>
+    <string name="retry">Retry</string>
+    <!-- Label under each row's thumbnail; the argument is the id supplied by the endpoint. -->
+    <string name="image_id_format">ID %1$d</string>
 </resources>
