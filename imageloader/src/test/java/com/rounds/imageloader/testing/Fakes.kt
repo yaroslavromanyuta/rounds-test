@@ -1,11 +1,17 @@
 package com.rounds.imageloader.testing
 
 import android.graphics.Bitmap
+import com.rounds.imageloader.cache.Clock
+import com.rounds.imageloader.cache.DiskImageCache
+import com.rounds.imageloader.cache.ImageCache
+import com.rounds.imageloader.cache.MemoryImageCache
 import com.rounds.imageloader.decode.ImageDecoder
 import com.rounds.imageloader.network.ImageDownloader
 import com.rounds.imageloader.request.Target
 import com.rounds.imageloader.request.TargetRequest
+import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.CoroutineDispatcher
 
 /**
  * Scripted downloader. Hand-written rather than mocked: the tests care about which URLs were
@@ -53,6 +59,36 @@ internal class FakeImageDecoder : ImageDecoder {
         return bitmaps[bytes.decodeToString()]
     }
 }
+
+/**
+ * Movable time source. TTL behaviour is asserted by advancing this rather than by waiting, so the
+ * four-hour boundary can be tested exactly and instantly.
+ */
+internal class FakeClock(var currentMillis: Long = 0L) : Clock {
+
+    override fun nowMillis(): Long = currentMillis
+
+    fun advanceBy(millis: Long) {
+        currentMillis += millis
+    }
+}
+
+/**
+ * Builds a cache over a real (temporary) directory and the test dispatcher, so tests exercise the
+ * production `MemoryImageCache`/`DiskImageCache` rather than substitutes of them.
+ */
+internal fun testImageCache(
+    directory: File,
+    clock: Clock,
+    diskDispatcher: CoroutineDispatcher,
+    memoryMaxSizeBytes: Int = DEFAULT_TEST_MEMORY_BYTES,
+): ImageCache = ImageCache(
+    memory = MemoryImageCache(clock, memoryMaxSizeBytes),
+    disk = DiskImageCache(directory, clock),
+    diskDispatcher = diskDispatcher,
+)
+
+private const val DEFAULT_TEST_MEMORY_BYTES = 8 * 1024 * 1024
 
 /** Records what would have been applied to an `ImageView`. */
 internal class FakeTarget : Target {
