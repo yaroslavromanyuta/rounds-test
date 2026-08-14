@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- The app fetches the image list itself, so it declares the permission its own code needs
+         rather than relying on the one :imageloader contributes for image downloads. The two
+         declarations are identical, and the manifest merger collapses them into one. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:name=".RoundsApplication"
         android:allowBackup="true"
