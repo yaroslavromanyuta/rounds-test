@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The library performs its own HTTP image downloads, so it declares the permission it needs
+         instead of relying on every consuming application to remember it. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>

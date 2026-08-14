@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tag key under which an ImageView stores its current image request. View.setTag(int, Any)
+         requires an application resource id, so the library declares its own. -->
+    <item name="imageloader_target_request" type="id" />
+</resources>
