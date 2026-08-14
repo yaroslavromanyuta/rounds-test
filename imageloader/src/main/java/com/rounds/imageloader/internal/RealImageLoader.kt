@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.widget.ImageView
 import androidx.annotation.DrawableRes
 import com.rounds.imageloader.ImageLoader
+import com.rounds.imageloader.cache.CacheSnapshot
 import com.rounds.imageloader.cache.Clock
 import com.rounds.imageloader.cache.DiskImageCache
 import com.rounds.imageloader.cache.ImageCache
@@ -39,6 +40,13 @@ import kotlinx.coroutines.withContext
  * dispatcher the scope is confined to. `GlobalScope` is never used, and callers never see a scope,
  * a dispatcher or a suspending function.
  *
+ * There are two kinds of coroutine here, and keeping them apart is what makes concurrent loads
+ * correct. A **target request** is per-`ImageView`: it owns the token, the placeholder and the
+ * cancellation, and it only ever awaits a result. A **shared load** is per URL-and-cache-generation,
+ * lives in [InFlightRequestRegistry] on this loader's scope, and owns the download, the decode and
+ * the cache write. Several target requests can await one shared load; cancelling one of them leaves
+ * the others — and the shared load — untouched.
+ *
  * Collaborators are constructor parameters with production defaults so tests can substitute the
  * network, the decoder, the cache, the clock and both dispatchers without any timing-sensitive
  * setup.
@@ -54,6 +62,7 @@ internal class RealImageLoader(
 
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
     private val tokens = AtomicLong()
+    private val inFlight = InFlightRequestRegistry(scope)
 
     override fun load(url: String, @DrawableRes placeholderRes: Int, target: ImageView) {
         load(ImageViewTarget(target), url, placeholderRes)
@@ -95,7 +104,9 @@ internal class RealImageLoader(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 // Memory, then disk, then network. The snapshot is taken before any of it, so an
-                // invalidation arriving while this request runs can reject its cache write.
+                // invalidation arriving while this request runs can reject its cache write — and,
+                // because it is half of the in-flight key, a request that starts after that
+                // invalidation cannot be served by work that started before it.
                 val snapshot = cache.snapshot(url)
 
                 val fromMemory = cache.getFromMemory(url)
@@ -119,17 +130,19 @@ internal class RealImageLoader(
                     cache.dropDiskEntry(url)
                 }
 
-                val bytes = withContext(ioDispatcher) { downloader.download(url) }
-                val bitmap = withContext(ioDispatcher) { decoder.decode(bytes) }
+                // A complete miss is the only path that reaches the network, so it is the only one
+                // worth sharing. The producer below runs once per key however many targets await
+                // it; a target that joins an existing load contributes nothing but its own wait.
+                val bitmap = inFlight.sharedLoad(InFlightKey(url, snapshot)) {
+                    val bytes = withContext(ioDispatcher) { downloader.download(url) }
+                    val decoded = withContext(ioDispatcher) { decoder.decode(bytes) }
+                    // Only a successful download *and* decode is worth caching. Storing here rather
+                    // than in each consumer means one write per result, not one per target.
+                    if (decoded != null) storeBestEffort(url, bytes, decoded, snapshot)
+                    decoded
+                }.await()
                 ensureActive()
-                if (bitmap != null) {
-                    // Only a successful download *and* decode is worth caching, and both tiers
-                    // share the one timestamp taken here.
-                    val cachedAtMillis = clock.nowMillis()
-                    cache.putInMemory(url, bitmap, cachedAtMillis, snapshot)
-                    cache.putOnDisk(url, bytes, cachedAtMillis, snapshot)
-                    applyIfCurrent(target, token, bitmap)
-                }
+                if (bitmap != null) applyIfCurrent(target, token, bitmap)
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (failure: Exception) {
@@ -141,6 +154,30 @@ internal class RealImageLoader(
         }
         target.setCurrentRequest(TargetRequest(token, job))
         job.start()
+    }
+
+    /**
+     * Stores a freshly downloaded image in both tiers, sharing the one timestamp taken here.
+     *
+     * Caching is best effort and this is where that is enforced: a storage failure must not become
+     * a load failure for every target awaiting this result. Cancellation is not a storage failure
+     * and is left to propagate.
+     */
+    private suspend fun storeBestEffort(
+        url: String,
+        bytes: ByteArray,
+        bitmap: Bitmap,
+        snapshot: CacheSnapshot,
+    ) {
+        try {
+            val cachedAtMillis = clock.nowMillis()
+            cache.putInMemory(url, bitmap, cachedAtMillis, snapshot)
+            cache.putOnDisk(url, bytes, cachedAtMillis, snapshot)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Exception) {
+            // Unwritable cache directory, full disk, revoked permission. The image is still shown.
+        }
     }
 
     internal fun clear(target: Target) {
