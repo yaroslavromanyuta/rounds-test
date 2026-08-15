@@ -82,7 +82,7 @@ class MainActivity : AppCompatActivity() {
 
         when (state) {
             is ImagesUiState.Content -> imagesAdapter.submitList(state.items)
-            is ImagesUiState.Error -> binding.errorMessage.text = state.message
+            is ImagesUiState.Error -> binding.errorMessage.setText(state.messageRes)
             ImagesUiState.Loading, ImagesUiState.Empty -> Unit
         }
     }

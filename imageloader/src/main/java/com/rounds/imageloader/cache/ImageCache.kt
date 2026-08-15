@@ -84,7 +84,9 @@ internal class ImageCache(
 
     /** Immediate half of `invalidate(url)`: the URL stops being served from memory at once. */
     fun invalidate(url: String) {
-        keyGenerations[url] = (keyGenerations[url] ?: INITIAL_GENERATION) + 1
+        // compute rather than get-then-put: the bump has to be atomic, or two concurrent
+        // invalidations of the same url could lose one and leave a snapshot looking current.
+        keyGenerations.compute(url) { _, current -> (current ?: INITIAL_GENERATION) + 1 }
         memory.remove(url)
     }
 

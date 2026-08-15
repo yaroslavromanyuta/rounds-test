@@ -1,5 +1,6 @@
 package com.rounds.test.app.presentation.viewmodel
 
+import com.rounds.test.app.R
 import com.rounds.test.app.presentation.model.ImageItem
 import com.rounds.test.app.testing.FakeImagesRepository
 import com.rounds.test.app.testing.MainDispatcherRule
@@ -69,8 +70,8 @@ class ImagesViewModelTest {
         repository.fail(0, IOException("Unexpected HTTP status 500 for https://internal.test/x"))
         advanceUntilIdle()
 
-        // Neither the exception's message nor its type reaches the state.
-        assertEquals(ImagesUiState.Error("Unable to load images"), viewModel.state.value)
+        // Neither the exception's message nor its type reaches the state - only a fixed resource id.
+        assertEquals(ImagesUiState.Error(R.string.images_error_message), viewModel.state.value)
     }
 
     @Test

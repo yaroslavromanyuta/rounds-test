@@ -1,17 +1,35 @@
-# rounds-test
+# Rounds Android Home Assignment
 
-Android home assignment: a custom image downloading/caching library plus a sample application that demonstrates it.
+A custom image downloading/caching library plus a sample application that demonstrates it.
 
 The library is written from scratch — no Glide, Coil, Picasso or Fresco, and no Retrofit/OkHttp either. Downloading is `HttpURLConnection`, decoding is `BitmapFactory`. The sample app uses Android Views/XML (no Jetpack Compose) and MVVM.
 
-> **Status — functionally complete (MR #6).**
-> The library downloads, decodes and displays remote images with placeholder support, per-target
-> request protection, a bounded memory cache, a persistent disk cache, four-hour expiry, manual
-> invalidation, and shared in-flight requests so concurrent loads of the same uncached URL perform
-> one download between them. The sample app fetches the supplied image list, renders it in a
-> RecyclerView with each row's image and id, shows a placeholder until each image arrives, and
-> exposes a button that clears the image cache and reloads the visible rows. Remaining work is
-> final test coverage, documentation review and submission polish.
+## Requirements implemented
+
+Every explicit requirement of the assignment, and where it lives.
+
+| Requirement | Where |
+|---|---|
+| **Library** — accepts a URL, a placeholder and a target `ImageView` | `ImageLoader.load(url, placeholderRes, target)` |
+| downloads the remote image | `network/HttpImageDownloader` (`HttpURLConnection`) |
+| decodes it | `decode/BitmapFactoryImageDecoder` (`BitmapFactory`) |
+| displays it in the target view | `request/ImageViewTarget` |
+| caches the image | `cache/MemoryImageCache` + `cache/DiskImageCache` |
+| cache valid for exactly 4 hours | `cache/CacheTtl.kt` — `now - cachedAt < 4h`, strict |
+| manual cache invalidation | `ImageLoader.clearCache()` and `ImageLoader.invalidate(url)` |
+| uses Kotlin Coroutines | `internal/RealImageLoader`, `internal/InFlightRequestRegistry` |
+| usable from Kotlin | [Kotlin example](#kotlin) |
+| usable from Java | [Java example](#java) — enforced by `JavaImageLoaderInteropTest`, written in Java |
+| no Glide or equivalent | no image-loading dependency anywhere in `gradle/libs.versions.toml` |
+| **App** — fetches the supplied JSON endpoint | `data/remote/HttpImagesRemoteDataSource` |
+| parses `id` and `imageUrl` | `data/remote/parser/ImageListJsonParser` |
+| displays a list | `presentation/ui/ImagesAdapter` + `RecyclerView` |
+| displays image and image id per row | `res/layout/item_image.xml` |
+| placeholder while loading | `res/drawable/image_placeholder.xml`, applied by the library |
+| cache-invalidation button | `MainActivity.clearImageCache()` → `ImageLoader.clearCache()` |
+| Android Views, no Jetpack Compose | XML layouts + ViewBinding; no Compose dependency exists |
+| MVVM | `MainActivity` → `ImagesViewModel` → `ImagesRepository` → `ImagesRemoteDataSource` |
+| Coroutines | `viewModelScope`, `StateFlow`, `withContext(Dispatchers.IO)` |
 
 ## Modules
 
@@ -66,13 +84,13 @@ Two explicit overloads rather than a Kotlin default argument: `@JvmOverloads` is
 ```kotlin
 private val imageLoader = (application as RoundsApplication).imageLoader
 
-imageLoader.load(item.url, R.drawable.placeholder, holder.imageView)
-imageLoader.load(item.url, holder.imageView)          // no placeholder
+imageLoader.load(item.imageUrl, R.drawable.image_placeholder, holder.imageView)
+imageLoader.load(item.imageUrl, holder.imageView)     // no placeholder
 
 // When a view is recycled or detached:
 imageLoader.clear(holder.imageView)
 
-imageLoader.invalidate(item.url)                      // forget one image
+imageLoader.invalidate(item.imageUrl)                 // forget one image
 imageLoader.clearCache()                              // forget all of them
 ```
 
@@ -81,12 +99,12 @@ imageLoader.clearCache()                              // forget all of them
 ```java
 ImageLoader loader = ImageLoader.create(context);
 
-loader.load(item.getUrl(), R.drawable.placeholder, imageView);
-loader.load(item.getUrl(), imageView);                // no placeholder
+loader.load(item.getImageUrl(), R.drawable.image_placeholder, imageView);
+loader.load(item.getImageUrl(), imageView);           // no placeholder
 
 loader.clear(imageView);
 
-loader.invalidate(item.getUrl());
+loader.invalidate(item.getImageUrl());
 loader.clearCache();
 ```
 
@@ -202,7 +220,7 @@ The field is `imageUrl`, the `id` is an integer, and the payload was inspected r
 | `Loading` | a fetch is in flight — also the initial state |
 | `Content(items)` | at least one record, in endpoint order |
 | `Empty` | the fetch succeeded and returned nothing; not an error |
-| `Error(message)` | the fetch failed; a fixed presentation-safe phrase, never exception text |
+| `Error(messageRes)` | the fetch failed; a fixed string resource, never exception text or type |
 
 Construction starts a fetch immediately: `Loading` → `Content` / `Empty` / `Error`. The state never stays at `Loading` after a failure.
 
@@ -277,8 +295,9 @@ Requires the Android SDK (`local.properties` → `sdk.dir`). Toolchain: AGP 9.3.
 .\gradlew.bat :imageloader:testDebugUnitTest  # image-loader tests only
 .\gradlew.bat :app:testDebugUnitTest        # sample app tests only
 .\gradlew.bat lint                          # Android Lint
-.\gradlew.bat connectedAndroidTest          # instrumented tests (needs a device/emulator)
 ```
+
+Everything is a JVM unit test — there is no instrumented source set. The Android-framework types this project actually needs to exercise (`Bitmap`, `ImageView`) sit behind small internal seams instead, so the interesting logic runs on the JVM in milliseconds; see the trade-offs below.
 
 The app tests never touch the production endpoint:
 
@@ -296,11 +315,14 @@ The image-loader tests are deterministic and offline:
 - cache behaviour is driven by an injectable `Clock`, never by waiting: the four-hour boundary is asserted at 4h−1ms, exactly 4h and 4h+1ms, and repeated reads are shown not to extend it. Tier ordering (memory hit skips disk and network, disk hit skips the network, expired entries re-download), timestamp preservation on disk→memory promotion, "failures are never cached", "a disk write failure still displays the image", and both invalidation-versus-in-flight races are covered too;
 - concurrency is asserted by download and decode counts rather than by racing threads: three simultaneous loads of one URL produce exactly one download and one decode and paint all three targets; two URLs stay independent; clearing one consumer mid-flight leaves the others painted; a recycled target still cannot be overwritten by the shared result it used to be waiting for; a failed shared load is retried by the next request; and a load started after `invalidate(url)` or `clearCache()` is shown *not* to join the pre-invalidation work;
 - the in-flight registry is also tested directly, which is where entry release after success, failure and cancellation is provable rather than inferred;
+- the decode bound that keeps an oversized image from crashing the host is asserted directly — full-size decoding below the limit, halving above it, powers of two only, and the supplied payload's 11000×7000 record proven to land under the platform's 100MB draw limit;
 - the disk cache runs against a real temporary directory — real files, real atomic renames, real corrupt-file handling — not a mocked filesystem;
 - `HttpImageDownloader` is exercised against a JDK `HttpServer` on an ephemeral loopback port — real HTTP, no production endpoint, no public image host;
 - three tests are written in Java to verify the API is usable from Java, including the placeholder-free overload and both cache-invalidation calls.
 
 ## Assumptions and trade-offs
+
+The assignment fixes the requirements but leaves the design open. The following are **engineering decisions made here**, not literal requirements from the brief: two cache tiers rather than one, in-flight deduplication, per-URL invalidation alongside the mandatory full clear, the injectable `Clock`, and the split into a separate `:imageloader` module.
 
 - **Placeholder is a `@DrawableRes Int`, optional via a second overload.** A `Drawable` overload adds API surface without demonstrating anything new; the assignment asks for a placeholder resource.
 - **No returned request handle.** `clear(target)` covers the cancellation the assignment needs, and keeps the Java API small.
@@ -308,7 +330,9 @@ The image-loader tests are deterministic and offline:
 - **No disk size limit.** Disk entries are pruned lazily by TTL when encountered, and the four-hour window bounds growth for this use case. A size-capped disk LRU would be the next step in a production library; the memory tier, where an unbounded cache actually crashes an app, *is* bounded.
 - **In-flight deduplication is an engineering decision.** The assignment asks for downloading and caching; sharing one download between concurrent requests for the same URL is our choice, made because a scrolling list produces exactly that pattern.
 - **A shared load may outlive all of its consumers.** If every waiting target is cancelled, the download continues and its result still populates the cache. This deliberately avoids reference-counting subscribers — a fragile mechanism for a small saving — and costs at most one already-started request. Target cancellation still guarantees what actually matters: no cancelled target is ever painted.
-- **Images are decoded at full resolution.** The sources are 1920×1080 wallpapers and the rows show 96×72dp thumbnails, so each decode costs far more memory than the row needs. The memory cache is bounded by heap fraction, so this is safe rather than fatal — measured on an emulator, the app holds ~70MB of native heap with the list scrolling and no `OutOfMemoryError`. Downsampling to the target size is the obvious next step for a production library, but it belongs to the loader, not the screen. For reference, warm-cache scrolling measured 92.9% janky frames at an 85ms median on the emulator, against 100% and 150ms for the device's own launcher on the same run — the emulator's software rendering dominates both.
+- **Decoding is bounded, but not resized to the target view.** Images are decoded at full resolution up to 2048px on either edge; beyond that `BitmapFactory.inSampleSize` halves them until they fit. This is a safety bound rather than a resizing pipeline — the 1920×1080 wallpapers that make up most of the payload are decoded untouched — and it is **not** optional: the supplied list contains an 11000×7000 record (id 47) which decodes to 308MB, and any bitmap over 100MB makes `ImageView.onDraw` throw `Canvas: trying to draw too large bitmap` on the UI thread, crashing the host app where no `catch` in this library could intercept it. Scaling each decode down to the exact row size would save more memory still, but the loader decodes once and shares the result between targets that may differ in size, so a per-view scale belongs to a later design, not to this bound.
+- **All disk work is serialised on a single-threaded dispatcher.** That is what makes invalidation ordering deterministic — a deletion queued by `clearCache()` always completes before a read queued after it, so a pending delete can never let a stale file be served. It costs parallel disk reads during a fast scroll, which is the cheaper half of the trade: the alternative is a lock protocol between reads, writes and deletions with no ordering guarantee to show for it.
 - **`Bitmap`/`ImageView` cannot be instantiated on the JVM.** Rather than adding Robolectric, view mutation sits behind a small internal `Target` seam so the interesting logic is plain-JVM testable; Mockito is used only to fabricate a `Bitmap` instance for identity assertions.
+- **No instrumented test source set.** The generated `androidTest` stub asserted only its own package name, so it was removed rather than left in place to imply coverage that does not exist. The behaviour it could have covered — adapter binding and recycling — was verified manually on an emulator instead, as listed above.
 - **Cross-protocol redirects are not followed.** `HttpURLConnection` does not follow an HTTP→HTTPS redirect; such a response is treated as a failure, which is safe rather than surprising.
 - **Cancellation of a request in flight does not interrupt a blocking socket read.** The result is discarded and the connection is closed when the read returns; interrupting the read would add complexity out of proportion to the benefit here.

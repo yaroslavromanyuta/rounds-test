@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.rounds.test.app.R
 import com.rounds.test.app.data.repository.ImagesRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -59,7 +60,9 @@ internal class ImagesViewModel(
                 // Being replaced, or the ViewModel being cleared, is normal — not a failure to show.
                 throw cancellation
             } catch (failure: Exception) {
-                _state.value = ImagesUiState.Error(GENERIC_ERROR_MESSAGE)
+                // The resource id, not the exception's text: raw transport messages are neither
+                // translatable nor safe to show, and resolving one here would need a Context.
+                _state.value = ImagesUiState.Error(R.string.images_error_message)
             }
         }
     }
@@ -73,12 +76,5 @@ internal class ImagesViewModel(
         fun factory(repository: ImagesRepository): ViewModelProvider.Factory = viewModelFactory {
             initializer { ImagesViewModel(repository) }
         }
-
-        /**
-         * Deliberately not the exception's message: raw transport text is neither translatable nor
-         * safe to show. Once the screen exists it can map [ImagesUiState.Error] to a string
-         * resource instead.
-         */
-        private const val GENERIC_ERROR_MESSAGE = "Unable to load images"
     }
 }
