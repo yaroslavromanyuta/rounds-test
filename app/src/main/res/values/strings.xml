@@ -1,10 +1,13 @@
 <resources>
-    <string name="app_name">My Application</string>
+    <string name="app_name">Rounds Images</string>
 
     <string name="images_title">Images</string>
     <string name="clear_image_cache">Clear image cache</string>
     <string name="image_cache_cleared">Image cache cleared</string>
     <string name="no_images_available">No images available</string>
+    <!-- Shown when the image list cannot be fetched. Deliberately generic: the transport's own
+         message is neither translatable nor safe to put in front of a user. -->
+    <string name="images_error_message">Unable to load images</string>
     <string name="retry">Retry</string>
     <!-- Label under each row's thumbnail; the argument is the id supplied by the endpoint. -->
     <string name="image_id_format">ID %1$d</string>

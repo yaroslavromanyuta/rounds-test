@@ -1,5 +1,6 @@
 package com.rounds.test.app.presentation.viewmodel
 
+import androidx.annotation.StringRes
 import com.rounds.test.app.presentation.model.ImageItem
 
 /**
@@ -18,8 +19,10 @@ internal sealed interface ImagesUiState {
     data object Empty : ImagesUiState
 
     /**
-     * The fetch failed. [message] is presentation-safe by construction — the ViewModel emits a
-     * fixed phrase, never an exception's text or class name.
+     * The fetch failed. [messageRes] is presentation-safe by construction — the ViewModel emits a
+     * fixed string resource, never an exception's text or class name. A resource id rather than a
+     * resolved string keeps the ViewModel free of [android.content.Context] and leaves the wording
+     * translatable.
      */
-    data class Error(val message: String) : ImagesUiState
+    data class Error(@param:StringRes val messageRes: Int) : ImagesUiState
 }

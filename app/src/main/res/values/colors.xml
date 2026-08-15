@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
     <!-- Fill of the row placeholder. Overridden in values-night so it stays visible in dark mode. -->
     <color name="image_placeholder_background">#FFE0E0E0</color>
 </resources>
