@@ -14,7 +14,7 @@ import androidx.collection.LruCache
  * `androidx.collection.LruCache` is used instead of `android.util.LruCache` because the latter is a
  * framework stub in JVM unit tests; the androidx one is ordinary Java and synchronises internally.
  */
-internal class MemoryImageCache(
+internal open class MemoryImageCache(
     private val clock: Clock,
     maxSizeBytes: Int = defaultMaxSizeBytes(),
 ) {
@@ -39,8 +39,12 @@ internal class MemoryImageCache(
      * [cachedAtMillis] is supplied by the caller rather than read from the clock here: an entry
      * promoted from disk must keep the timestamp it was originally downloaded with, otherwise a
      * disk hit would silently restart the four-hour window.
+     *
+     * `open` — like the class — only so a test can suspend a store inside `ImageCache`'s memory
+     * transaction and prove that an invalidation cannot interleave with it. Nothing in the library
+     * subclasses this.
      */
-    fun put(url: String, bitmap: Bitmap, cachedAtMillis: Long) {
+    open fun put(url: String, bitmap: Bitmap, cachedAtMillis: Long) {
         entries.put(url, Entry(bitmap, cachedAtMillis))
     }
 
