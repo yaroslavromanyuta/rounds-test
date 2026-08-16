@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -45,7 +46,7 @@ import kotlinx.coroutines.withContext
  * cancellation, and it only ever awaits a result. A **shared load** is per URL-and-cache-generation,
  * lives in [InFlightRequestRegistry] on this loader's scope, and owns the download, the decode and
  * the cache write. Several target requests can await one shared load; cancelling one of them leaves
- * the others — and the shared load — untouched.
+ * the others untouched, while cancelling the final consumer cancels obsolete shared work.
  *
  * Collaborators are constructor parameters with production defaults so tests can substitute the
  * network, the decoder, the cache, the clock and both dispatchers without any timing-sensitive
@@ -58,6 +59,7 @@ internal class RealImageLoader(
     private val clock: Clock = Clock.SYSTEM,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val loadLimiter: LoadLimiter = SemaphoreLoadLimiter(DEFAULT_MAX_CONCURRENT_LOADS),
 ) : ImageLoader {
 
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -115,9 +117,19 @@ internal class RealImageLoader(
                     return@launch
                 }
 
-                val fromDisk = cache.readFromDisk(url)
-                if (fromDisk != null) {
-                    val bitmap = withContext(ioDispatcher) { decoder.decode(fromDisk.bytes) }
+                val diskResult = loadLimiter.run {
+                    cache.readFromDisk(url)?.let { cached ->
+                        val bitmap = withContext(ioDispatcher) { decoder.decode(cached.bytes) }
+                        if (bitmap == null) {
+                            // Identity verification rereads the entry, so keep it under the same
+                            // admission permit as the encoded bytes and corrupt decode.
+                            cache.dropDiskEntry(url, cached, snapshot)
+                        }
+                        cached to bitmap
+                    }
+                }
+                if (diskResult != null) {
+                    val (fromDisk, bitmap) = diskResult
                     ensureActive()
                     if (bitmap != null) {
                         // Promotion keeps the disk entry's own timestamp: a disk hit must not
@@ -126,21 +138,28 @@ internal class RealImageLoader(
                         applyIfCurrent(target, token, bitmap)
                         return@launch
                     }
-                    // Stored bytes are not a decodable image — drop them and fall through.
-                    cache.dropDiskEntry(url)
+                    // Stored bytes were not a decodable image and were conditionally dropped
+                    // inside the disk pipeline permit; fall through to the network.
                 }
 
                 // A complete miss is the only path that reaches the network, so it is the only one
                 // worth sharing. The producer below runs once per key however many targets await
                 // it; a target that joins an existing load contributes nothing but its own wait.
-                val bitmap = inFlight.sharedLoad(InFlightKey(url, snapshot)) {
-                    val bytes = withContext(ioDispatcher) { downloader.download(url) }
-                    val decoded = withContext(ioDispatcher) { decoder.decode(bytes) }
-                    // Only a successful download *and* decode is worth caching. Storing here rather
-                    // than in each consumer means one write per result, not one per target.
-                    if (decoded != null) storeBestEffort(url, bytes, decoded, snapshot)
-                    decoded
-                }.await()
+                val subscription = inFlight.sharedLoad(InFlightKey(url, snapshot)) {
+                    loadLimiter.run {
+                        val bytes = withContext(ioDispatcher) { downloader.download(url) }
+                        val decoded = withContext(ioDispatcher) { decoder.decode(bytes) }
+                        // Only a successful download *and* decode is worth caching. Storing here
+                        // rather than in each consumer means one write per result, not one per target.
+                        if (decoded != null) storeBestEffort(url, bytes, decoded, snapshot)
+                        decoded
+                    }
+                }
+                val bitmap = try {
+                    subscription.await()
+                } finally {
+                    subscription.release()
+                }
                 ensureActive()
                 if (bitmap != null) applyIfCurrent(target, token, bitmap)
             } catch (cancellation: CancellationException) {
@@ -187,6 +206,11 @@ internal class RealImageLoader(
         }
     }
 
+    /** Cancels loader-owned work. Internal because the production loader is process-wide. */
+    internal fun shutdown() {
+        scope.cancel()
+    }
+
     /**
      * A newer request may have claimed the target while this one was in flight; the older result
      * must not win, regardless of completion order or of which tier produced it.
@@ -198,6 +222,7 @@ internal class RealImageLoader(
     internal companion object {
 
         private const val CACHE_DIRECTORY_NAME = "image_loader"
+        private const val DEFAULT_MAX_CONCURRENT_LOADS = 2
 
         /**
          * Builds the production loader. Only the application context is retained, and only to
@@ -213,7 +238,13 @@ internal class RealImageLoader(
                 // Serialising disk work keeps invalidation ordered against reads.
                 diskDispatcher = Dispatchers.IO.limitedParallelism(1),
             )
-            return RealImageLoader(cache = cache, clock = clock)
+            return RealImageLoader(
+                cache = cache,
+                downloader = HttpImageDownloader(
+                    temporaryDirectory = cacheDirectory,
+                ),
+                clock = clock,
+            )
         }
     }
 }

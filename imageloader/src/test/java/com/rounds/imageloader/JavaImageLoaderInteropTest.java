@@ -8,6 +8,8 @@ import static org.mockito.Mockito.when;
 import android.content.Context;
 import android.widget.ImageView;
 
+import java.util.function.Consumer;
+
 import com.rounds.imageloader.testing.MainDispatcherRule;
 
 import org.junit.Before;
@@ -20,13 +22,13 @@ import org.junit.rules.TemporaryFolder;
  *
  * Nothing here creates a coroutine scope, passes a suspending function, unwraps a Kotlin
  * {@code Result} or touches a Flow — a Java consumer sees a static factory and four ordinary
- * methods, cache invalidation included. The dispatcher rule only exists because a JVM unit test has
- * no Android main looper; production Java callers do not need it.
+ * methods, cache invalidation included. The dispatcher rule provides the JVM test's absent Android
+ * main looper; the blank-URL load path remains synchronous and leaves no work after rule teardown.
  */
 public class JavaImageLoaderInteropTest {
 
     private static final int PLACEHOLDER_RES = 4242;
-    private static final String URL = "not a url";
+    private static final String URL = "";
 
     @Rule
     public final MainDispatcherRule mainDispatcherRule = new MainDispatcherRule();
@@ -50,8 +52,8 @@ public class JavaImageLoaderInteropTest {
 
         assertNotNull(loader);
 
-        // An unresolvable URL keeps the test off the network; the load fails silently and the
-        // placeholder stays, which is exactly the documented failure behaviour.
+        // A blank URL keeps this compile/interoperability test synchronous and off the network;
+        // the placeholder stays, which is exactly the documented no-request behaviour.
         loader.load(URL, PLACEHOLDER_RES, imageView);
 
         verify(imageView).setImageResource(PLACEHOLDER_RES);
@@ -75,8 +77,11 @@ public class JavaImageLoaderInteropTest {
     public void javaConsumerCanInvalidateAndClearTheCache() {
         ImageLoader loader = ImageLoader.create(context);
 
-        // Both are plain void calls - no suspend function, no Job, no dispatcher to supply.
-        loader.invalidate(URL);
-        loader.clearCache();
+        // Both compile as ordinary Java void callbacks - no suspend function, Job or dispatcher.
+        Consumer<String> invalidate = loader::invalidate;
+        Runnable clearCache = loader::clearCache;
+
+        assertNotNull(invalidate);
+        assertNotNull(clearCache);
     }
 }

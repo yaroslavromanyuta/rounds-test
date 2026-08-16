@@ -139,6 +139,45 @@ class RealImageLoaderCacheTest {
     }
 
     @Test
+    fun `stale corrupt cleanup cannot delete a post-invalidation replacement`() =
+        runTest(dispatcher) {
+            val cache = ImageCache(memory, disk, dispatcher)
+            disk.write(URL_A, BYTES_B, START_MILLIS)
+            val staleSnapshot = cache.snapshot(URL_A)
+            val staleEntry = requireNotNull(cache.readFromDisk(URL_A))
+            assertArrayEquals(BYTES_B, staleEntry.bytes)
+
+            // Models invalidation and a fresh download completing while the old corrupt decode was
+            // suspended. Its later cleanup still carries the pre-invalidation snapshot.
+            cache.invalidate(URL_A)
+            cache.invalidateOnDisk(URL_A)
+            val freshSnapshot = cache.snapshot(URL_A)
+            cache.putOnDisk(URL_A, BYTES_A, START_MILLIS, freshSnapshot)
+
+            cache.dropDiskEntry(URL_A, staleEntry, staleSnapshot)
+
+            assertArrayEquals(BYTES_A, disk.read(URL_A)?.bytes)
+        }
+
+    @Test
+    fun `delayed corrupt cleanup cannot delete a same-generation replacement`() =
+        runTest(dispatcher) {
+            val cache = ImageCache(memory, disk, dispatcher)
+            disk.write(URL_A, BYTES_B, START_MILLIS)
+            val snapshot = cache.snapshot(URL_A)
+            val staleEntry = requireNotNull(cache.readFromDisk(URL_A))
+
+            // Another request removes the corrupt entry and writes a valid response without any
+            // invalidation, so the generation remains unchanged.
+            disk.remove(URL_A)
+            cache.putOnDisk(URL_A, BYTES_A, START_MILLIS, snapshot)
+
+            cache.dropDiskEntry(URL_A, staleEntry, snapshot)
+
+            assertArrayEquals(BYTES_A, disk.read(URL_A)?.bytes)
+        }
+
+    @Test
     fun `a failed download caches nothing`() = runTest(dispatcher) {
         downloader.failWith(URL_A, IOException("offline"))
 

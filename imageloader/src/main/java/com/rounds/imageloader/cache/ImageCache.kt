@@ -77,9 +77,18 @@ internal class ImageCache(
         withContext(diskDispatcher) { disk.write(url, bytes, cachedAtMillis) }
     }
 
-    /** Drops a disk entry whose bytes turned out not to be a decodable image. */
-    suspend fun dropDiskEntry(url: String) {
-        withContext(diskDispatcher) { disk.remove(url) }
+    /** Drops corrupt bytes only if the on-disk entry is still exactly the one that was decoded. */
+    suspend fun dropDiskEntry(url: String, expected: CachedBytes, snapshot: CacheSnapshot) {
+        withContext(diskDispatcher) {
+            if (!isCurrent(url, snapshot)) return@withContext
+            val current = disk.read(url) ?: return@withContext
+            if (
+                current.cachedAtMillis == expected.cachedAtMillis &&
+                current.bytes.contentEquals(expected.bytes)
+            ) {
+                disk.remove(url)
+            }
+        }
     }
 
     /** Immediate half of `invalidate(url)`: the URL stops being served from memory at once. */

@@ -45,7 +45,7 @@ class InFlightRequestRegistryTest {
         val first = registry.sharedLoad(KEY_A) { producerCalls++; bitmapA }
         val second = registry.sharedLoad(KEY_A) { producerCalls++; bitmapB }
 
-        assertSame("the second caller must join, not create", first, second)
+        assertEquals("the second caller must join, not create", 1, registry.inFlightCount())
         assertEquals(bitmapA, first.await())
         assertEquals(bitmapA, second.await())
         assertEquals(1, producerCalls)
@@ -110,10 +110,11 @@ class InFlightRequestRegistryTest {
         advanceUntilIdle()
         assertEquals(1, registry.inFlightCount())
 
-        shared.cancel()
+        shared.release()
         advanceUntilIdle()
 
         assertEquals(0, registry.inFlightCount())
+        assertFalse(shared.isActive)
     }
 
     @Test
@@ -121,18 +122,34 @@ class InFlightRequestRegistryTest {
         runTest(dispatcher) {
             val registry = InFlightRequestRegistry(loaderScope)
             val blocked = CompletableDeferred<Bitmap?>()
-            val shared = registry.sharedLoad(KEY_A) { blocked.await() }
+            val abandonedSubscription = registry.sharedLoad(KEY_A) { blocked.await() }
+            val retainedSubscription = registry.sharedLoad(KEY_A) { blocked.await() }
 
             var abandoned: Bitmap? = null
             var received: Bitmap? = null
-            val giveUp = launch { abandoned = shared.await() }
-            val waitOn = launch { received = shared.await() }
+            val giveUp = launch {
+                try {
+                    abandoned = abandonedSubscription.await()
+                } finally {
+                    abandonedSubscription.release()
+                }
+            }
+            val waitOn = launch {
+                try {
+                    received = retainedSubscription.await()
+                } finally {
+                    retainedSubscription.release()
+                }
+            }
             advanceUntilIdle()
 
             giveUp.cancel()
             advanceUntilIdle()
 
-            assertTrue("one consumer leaving must not end the shared work", shared.isActive)
+            assertTrue(
+                "one consumer leaving must not end the shared work",
+                retainedSubscription.isActive,
+            )
 
             blocked.complete(bitmapA)
             advanceUntilIdle()
@@ -141,6 +158,29 @@ class InFlightRequestRegistryTest {
             assertSame(bitmapA, received)
             assertTrue(waitOn.isCompleted)
             assertFalse(waitOn.isCancelled)
+        }
+
+    @Test
+    fun `releasing final consumers cancels operations queued on the load limiter`() =
+        runTest(dispatcher) {
+            val registry = InFlightRequestRegistry(loaderScope)
+            val limiter = SemaphoreLoadLimiter(maxConcurrentLoads = 2)
+            val blocked = CompletableDeferred<Bitmap?>()
+            val subscriptions = List(20) { index ->
+                val key = InFlightKey(
+                    "https://example.test/$index.png",
+                    CacheSnapshot(0L, 0L),
+                )
+                registry.sharedLoad(key) { limiter.run { blocked.await() } }
+            }
+            advanceUntilIdle()
+            assertEquals(20, registry.inFlightCount())
+
+            subscriptions.forEach { it.release() }
+            advanceUntilIdle()
+
+            assertEquals(0, registry.inFlightCount())
+            subscriptions.forEach { assertFalse(it.isActive) }
         }
 
     private companion object {
