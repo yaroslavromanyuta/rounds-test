@@ -1,6 +1,6 @@
 package com.rounds.test.app.presentation.ui
 
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test

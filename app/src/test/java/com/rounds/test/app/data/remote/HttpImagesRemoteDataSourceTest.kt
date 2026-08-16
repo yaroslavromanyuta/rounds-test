@@ -1,7 +1,7 @@
 package com.rounds.test.app.data.remote
 
 import com.rounds.test.app.data.remote.parser.ImageListParseException
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 import com.sun.net.httpserver.HttpServer
 import java.io.IOException
 import java.net.InetAddress

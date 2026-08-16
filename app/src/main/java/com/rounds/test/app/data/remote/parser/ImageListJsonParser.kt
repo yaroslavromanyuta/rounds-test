@@ -1,6 +1,6 @@
 package com.rounds.test.app.data.remote.parser
 
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONException

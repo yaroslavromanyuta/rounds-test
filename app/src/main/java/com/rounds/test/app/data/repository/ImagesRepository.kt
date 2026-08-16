@@ -1,6 +1,6 @@
 package com.rounds.test.app.data.repository
 
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 
 /**
  * The presentation layer's only door to image-list data.

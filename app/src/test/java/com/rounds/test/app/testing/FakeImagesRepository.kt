@@ -1,7 +1,7 @@
 package com.rounds.test.app.testing
 
 import com.rounds.test.app.data.repository.ImagesRepository
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 import kotlinx.coroutines.CompletableDeferred
 
 /**

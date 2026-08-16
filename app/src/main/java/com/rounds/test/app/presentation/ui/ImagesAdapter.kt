@@ -8,7 +8,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.rounds.imageloader.ImageLoader
 import com.rounds.test.app.R
 import com.rounds.test.app.databinding.ItemImageBinding
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 
 /**
  * Renders the image list. Each row shows the item's id and the image the library loads for it.
