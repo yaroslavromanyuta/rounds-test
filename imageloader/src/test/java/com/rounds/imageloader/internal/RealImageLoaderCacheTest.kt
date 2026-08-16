@@ -11,13 +11,17 @@ import com.rounds.imageloader.testing.FakeImageDecoder
 import com.rounds.imageloader.testing.FakeImageDownloader
 import com.rounds.imageloader.testing.FakeTarget
 import java.io.IOException
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -286,6 +290,59 @@ class RealImageLoaderCacheTest {
     }
 
     @Test
+    fun `clearCache queues the file deletion before returning off the main dispatcher`() {
+        val fixture = SeparatelyScheduledLoader()
+        memory.put(URL_A, bitmapA, START_MILLIS)
+        disk.write(URL_A, BYTES_A, START_MILLIS)
+        val before = fixture.cache.snapshot(URL_A)
+
+        // Called from the JUnit thread, which is neither dispatcher - the case the bug needed.
+        fixture.loader.clearCache()
+
+        assertNull("memory must be emptied synchronously", memory.get(URL_A))
+        assertNotEquals(
+            "the generation must be bumped synchronously",
+            before,
+            fixture.cache.snapshot(URL_A),
+        )
+        assertNotNull("the deletion belongs to the disk dispatcher, not the caller", diskEntryA())
+
+        // Only the disk scheduler is advanced. Anything still waiting on the paused main dispatcher
+        // cannot have submitted work, so a deletion that runs here was queued before the return.
+        fixture.diskScheduler.advanceUntilIdle()
+
+        assertNull("the deletion must already have been queued on the disk queue", diskEntryA())
+        fixture.assertMainDispatcherStayedPaused()
+    }
+
+    @Test
+    fun `invalidate queues the file deletion before returning off the main dispatcher`() {
+        val fixture = SeparatelyScheduledLoader()
+        memory.put(URL_A, bitmapA, START_MILLIS)
+        memory.put(URL_B, bitmapB, START_MILLIS)
+        disk.write(URL_A, BYTES_A, START_MILLIS)
+        disk.write(URL_B, BYTES_B, START_MILLIS)
+        val before = fixture.cache.snapshot(URL_A)
+
+        fixture.loader.invalidate(URL_A)
+
+        assertNull("memory must drop the url synchronously", memory.get(URL_A))
+        assertNotEquals(
+            "the url's generation must be bumped synchronously",
+            before,
+            fixture.cache.snapshot(URL_A),
+        )
+        assertNotNull("the deletion belongs to the disk dispatcher, not the caller", diskEntryA())
+
+        fixture.diskScheduler.advanceUntilIdle()
+
+        assertNull("the deletion must already have been queued on the disk queue", diskEntryA())
+        assertNotNull("only the invalidated url may be deleted", disk.peek(URL_B))
+        assertNotNull(memory.get(URL_B))
+        fixture.assertMainDispatcherStayedPaused()
+    }
+
+    @Test
     fun `a load in flight when the cache is cleared cannot repopulate it`() = runTest(dispatcher) {
         downloader.respondWith(URL_A, BYTES_A)
         decoder.decodeTo(BYTES_A, bitmapA)
@@ -312,6 +369,49 @@ class RealImageLoaderCacheTest {
         assertEquals(listOf<Bitmap>(bitmapA), target.appliedBitmaps)
         assertNull(memory.get(URL_A))
         assertNull(disk.read(URL_A))
+    }
+
+    /** Reads [URL_A] off disk without promoting it, so asserting on it changes no LRU state. */
+    private fun diskEntryA() = disk.peek(URL_A)
+
+    /**
+     * A loader whose main and disk dispatchers are separate schedulers, both paused.
+     *
+     * That separation is what makes submission ordering observable: advancing the disk scheduler
+     * can only run work already queued on it, never work still sitting on the main one. The tests
+     * that share one [StandardTestDispatcher] for both cannot distinguish the two, because
+     * `advanceUntilIdle` there drains whatever the main dispatcher was holding as well.
+     */
+    private inner class SeparatelyScheduledLoader {
+
+        val diskScheduler = TestCoroutineScheduler()
+        val cache = ImageCache(memory, disk, StandardTestDispatcher(diskScheduler))
+
+        private val mainScheduler = TestCoroutineScheduler()
+        private val mainDispatcher = StandardTestDispatcher(mainScheduler)
+        private var mainDispatcherRan = false
+
+        val loader = RealImageLoader(
+            cache = cache,
+            downloader = downloader,
+            decoder = decoder,
+            clock = clock,
+            // Unused: neither test downloads or decodes anything.
+            ioDispatcher = StandardTestDispatcher(diskScheduler),
+            mainDispatcher = mainDispatcher,
+        )
+
+        init {
+            // A sentinel that only runs if the main scheduler is drained, which no test here does.
+            mainDispatcher.dispatch(EmptyCoroutineContext, Runnable { mainDispatcherRan = true })
+        }
+
+        fun assertMainDispatcherStayedPaused() {
+            assertFalse(
+                "the main dispatcher must stay paused, or the test proves nothing about ordering",
+                mainDispatcherRan,
+            )
+        }
     }
 
     private fun loaderWith(cache: ImageCache) = RealImageLoader(

@@ -15,9 +15,10 @@ import com.rounds.imageloader.internal.RealImageLoader
  * Coroutines are an implementation detail — consumers never supply a scope, a dispatcher or a
  * suspending function, which keeps the library equally usable from Java and Kotlin.
  *
- * Call [load] and [clear] from the main thread, as with any other view mutation. An instance is
- * intended to be created once per process and holds no Activity, Fragment or view of its own.
- * Create one with [create].
+ * [load] and [clear] mutate the target view, so call them from the main thread, as with any other
+ * view operation. [clearCache] and [invalidate] touch no view and may be called from any thread.
+ * An instance is intended to be created once per process and holds no Activity, Fragment or view
+ * of its own. Create one with [create].
  */
 interface ImageLoader {
 
@@ -53,18 +54,28 @@ interface ImageLoader {
     fun clear(target: ImageView)
 
     /**
-     * Removes every cached image from both memory and disk.
+     * Removes every cached image from both memory and disk. Callable from any thread.
      *
-     * The cache is logically empty as soon as this returns — a load started afterwards will not be
-     * served an old image — while the file deletion completes in the background. A load that was
-     * already in flight when this was called cannot repopulate the cache with what it downloaded
-     * before the invalidation.
+     * Two things happen before this returns, whichever thread calls it: memory is emptied, and the
+     * deletion of the cached files is submitted to the queue that serialises disk work. A load
+     * started after this returns therefore queues its disk read behind that deletion and is not
+     * served an old image from either tier. A load that was already in flight cannot repopulate the
+     * cache with what it downloaded before the invalidation.
+     *
+     * The files themselves are deleted asynchronously. This returns without waiting for that I/O
+     * and reports no completion, so there is no point at which the caller can observe the disk as
+     * physically empty. That last guarantee therefore depends on the deletion actually happening,
+     * and deleting is best effort: if the filesystem refuses, those bytes stay on disk and a later
+     * load can still be served them, until they expire with the normal four-hour TTL or a fresh
+     * download replaces them. The same applies if the process dies before the queued deletion runs.
+     * This is neither a secure erase nor durable across process death.
      */
     fun clearCache()
 
     /**
      * Removes the cached image for [url] from both memory and disk, leaving every other entry in
-     * place. Same immediacy and same in-flight guarantee as [clearCache].
+     * place. Callable from any thread, with the same immediacy, the same in-flight guarantee and
+     * the same best-effort, non-durable disk deletion as [clearCache].
      */
     fun invalidate(url: String)
 
