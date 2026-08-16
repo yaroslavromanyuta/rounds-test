@@ -241,12 +241,10 @@ class DiskImageCacheTest {
         cache.write(URL_B, payload(), START_MILLIS)
         val first = listOf(URL_A, URL_B).minByOrNull(CacheKey::of)
         val second = listOf(URL_A, URL_B).maxByOrNull(CacheKey::of)
-        // If the filesystem had refused the access-time write, the two would differ by however long
-        // the writes took and this would be testing something else.
-        assertEquals(
-            File(directory, CacheKey.of(URL_A)).lastModified(),
-            File(directory, CacheKey.of(URL_B)).lastModified(),
-        )
+        // A filesystem with coarse timestamp granularity stores two accesses as one value; the file
+        // name is then all that is left to order them by.
+        val sharedStamp = File(directory, CacheKey.of(URL_A)).lastModified()
+        assertTrue(File(directory, CacheKey.of(URL_B)).setLastModified(sharedStamp))
 
         clock.advanceBy(ONE_MINUTE_MILLIS)
         cache.write(URL_C, payload(), START_MILLIS)
@@ -352,11 +350,13 @@ class DiskImageCacheTest {
     }
 
     @Test
-    fun `pruning ignores response spools, unrelated files and directories`() {
+    fun `pruning ignores response spools, write temporaries, unrelated files and directories`() {
         val spool = temporaryFolder.newFile("image-loader-response-active.tmp")
+        // Another instance may be part-way through this write; age is no proof that it is debris.
+        val temporary = temporaryFolder.newFile("imageloader1234567890.tmp")
         val unrelated = temporaryFolder.newFile("notes.txt")
         val nested = temporaryFolder.newFolder("0".repeat(64))
-        listOf(spool, unrelated).forEach { file -> file.writeBytes(payload()) }
+        listOf(spool, temporary, unrelated).forEach { file -> file.writeBytes(payload()) }
         val cache = cacheWithBudget(ENTRY_BYTES)
         cache.write(URL_A, payload(), START_MILLIS)
         clock.advanceBy(ONE_MINUTE_MILLIS)
@@ -367,8 +367,87 @@ class DiskImageCacheTest {
         assertNull(cache.read(URL_A))
         assertNotNull(cache.read(URL_B))
         assertTrue(spool.isFile)
+        assertTrue(temporary.isFile)
         assertTrue(unrelated.isFile)
         assertTrue(nested.isDirectory)
+    }
+
+    @Test
+    fun `an old write temporary is still left alone by pruning`() {
+        val temporary = temporaryFolder.newFile("imageloader9876543210.tmp")
+        temporary.writeBytes(payload())
+        assertTrue(temporary.setLastModified(START_MILLIS - ONE_HOUR_MILLIS))
+        val cache = cacheWithBudget(ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        // A stalled 32 MiB write can look this old, and unlinking its pathname would break the
+        // rename that finishes it. Age is not ownership, so pruning never touches temporaries.
+        assertTrue(temporary.isFile)
+        assertNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `two caches over one directory stay inside the shared budget`() {
+        val first = cacheWithBudget(2 * ENTRY_BYTES)
+        val second = cacheWithBudget(2 * ENTRY_BYTES)
+
+        // Interleaved writers: without shared accounting the first cache still believes it holds
+        // one entry and lets the directory reach three.
+        first.write(URL_A, payload(), START_MILLIS)
+        assertTrue(canonicalBytes() <= 2 * ENTRY_BYTES)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        second.write(URL_B, payload(), START_MILLIS)
+        assertTrue(canonicalBytes() <= 2 * ENTRY_BYTES)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        first.write(URL_C, payload(), START_MILLIS)
+
+        assertEquals(2 * ENTRY_BYTES, canonicalBytes())
+        assertNull(first.read(URL_A))
+        assertNotNull(second.read(URL_B))
+        assertNotNull(first.read(URL_C))
+    }
+
+    @Test
+    fun `a write after the clock rolls back is still the most recently used entry`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        // Downloaded three hours ago, so a half-hour rollback below leaves them inside the TTL and
+        // the test is about access order rather than about expiry.
+        cache.write(URL_A, payload(), START_MILLIS - 3 * ONE_HOUR_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS - 3 * ONE_HOUR_MILLIS)
+
+        // The device clock goes backwards - a manual change, or a network time correction.
+        clock.currentMillis = START_MILLIS - 30 * ONE_MINUTE_MILLIS
+        cache.write(URL_C, payload(), clock.currentMillis)
+
+        // C is the newest access, so the oldest entry is evicted rather than C itself.
+        assertEquals(2 * ENTRY_BYTES, canonicalBytes())
+        assertNotNull(cache.read(URL_C))
+        assertNull(cache.read(URL_A))
+    }
+
+    @Test
+    fun `a read after the clock rolls back still promotes the entry it served`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS - 3 * ONE_HOUR_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS - 3 * ONE_HOUR_MILLIS)
+
+        val stampBeforeRollback = File(directory, CacheKey.of(URL_B)).lastModified()
+
+        clock.currentMillis = START_MILLIS - 30 * ONE_MINUTE_MILLIS
+        assertNotNull(cache.read(URL_A))
+
+        // Serving A recorded an access at least as recent as B's, rather than the rolled-back
+        // clock, which would have put A first in line for eviction. Asserted on the recorded stamps
+        // rather than on which file survives: consecutive accesses are a millisecond apart, and a
+        // filesystem with second granularity would store them as the same value.
+        assertTrue(File(directory, CacheKey.of(URL_A)).lastModified() >= stampBeforeRollback)
+        assertNotNull(cache.read(URL_A))
     }
 
     @Test
@@ -401,52 +480,6 @@ class DiskImageCacheTest {
         cache.write(URL_C, payload(), START_MILLIS)
 
         assertNull(cache.read(URL_A))
-        assertNotNull(cache.read(URL_B))
-    }
-
-    @Test
-    fun `write temporaries left by a dead process are swept on the first operation`() {
-        val orphan = temporaryFolder.newFile("imageloader1234567890.tmp")
-        orphan.writeBytes(payload())
-        assertTrue(orphan.setLastModified(START_MILLIS - ONE_HOUR_MILLIS))
-        val cache = cacheWithBudget(2 * ENTRY_BYTES)
-        assertTrue("swept during construction", orphan.isFile)
-
-        cache.write(URL_A, payload(), START_MILLIS)
-
-        // Excluded from the budget, so nothing else would ever reclaim them.
-        assertFalse(orphan.exists())
-        assertNotNull(cache.read(URL_A))
-    }
-
-    @Test
-    fun `a temporary from a write in progress is not swept`() {
-        val active = temporaryFolder.newFile("imageloader9876543210.tmp")
-        active.writeBytes(payload())
-        assertTrue(active.setLastModified(START_MILLIS))
-        val cache = cacheWithBudget(2 * ENTRY_BYTES)
-
-        cache.write(URL_A, payload(), START_MILLIS)
-
-        // Another writer may still be filling it; unlinking it would cost that image its entry.
-        assertTrue(active.isFile)
-    }
-
-    @Test
-    fun `a temporary too young to sweep is reclaimed by a later pass`() {
-        val debris = temporaryFolder.newFile("imageloader5555555555.tmp")
-        debris.writeBytes(payload())
-        assertTrue(debris.setLastModified(START_MILLIS))
-        val cache = cacheWithBudget(ENTRY_BYTES)
-        cache.write(URL_A, payload(), START_MILLIS)
-        assertTrue("swept while it could still belong to a live write", debris.isFile)
-
-        // A crash mid-write followed by an immediate restart leaves debris that the first pass has
-        // to leave alone; the next full pass is what reclaims it.
-        clock.advanceBy(2 * ONE_MINUTE_MILLIS)
-        cache.write(URL_B, payload(), START_MILLIS)
-
-        assertFalse(debris.exists())
         assertNotNull(cache.read(URL_B))
     }
 

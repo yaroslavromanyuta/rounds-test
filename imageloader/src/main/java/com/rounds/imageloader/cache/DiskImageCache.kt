@@ -4,6 +4,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Persistent cache of downloaded image bytes.
@@ -19,13 +20,16 @@ import java.io.IOException
  * least-recently-used-first until they fit the budget again.
  *
  * Every method is blocking file I/O and must be called from a background dispatcher — [ImageCache]
- * is what guarantees that. That dispatcher is single-threaded, which is also what serialises the
- * budget bookkeeping below.
+ * is what guarantees that.
  *
  * Caching is best effort: a failure to write, read or delete never propagates to the caller, since
  * a cache problem must not turn a successfully downloaded image into a UI failure. Budget pruning
  * inherits that: if the filesystem refuses a deletion the cache may stay over budget rather than
- * failing a load.
+ * failing a load. Bytes belonging to a write in progress — the temporary this class renames into
+ * place — are outside the budget and are never deleted by pruning, because age cannot prove that
+ * such a file is abandoned rather than owned by a slow write elsewhere. A temporary orphaned by a
+ * process that died mid-write is therefore reclaimed by `clearCache()` or by the system reclaiming
+ * the cache directory, not here.
  */
 internal class DiskImageCache(
     private val directory: File,
@@ -37,8 +41,30 @@ internal class DiskImageCache(
         require(maxSizeBytes > 0) { "maxSizeBytes must be positive" }
     }
 
-    /** One canonical entry with the size and access time the current pass decided on. */
-    private class Entry(val file: File, val lengthBytes: Long, val lastModifiedMillis: Long)
+    /** One canonical entry with the size and access stamp the current pass read from disk. */
+    private class Entry(val file: File, val lengthBytes: Long, val accessStamp: Long)
+
+    /**
+     * The bookkeeping belongs to the *directory*, not to the object holding it.
+     *
+     * `ImageLoader.create()` is a plain factory, so two loaders can end up over one cache directory,
+     * each writing into it. If each kept its own running total, neither would see the other's bytes
+     * between scans and the directory could sit well over the budget. Keying the state by the
+     * directory means every instance adds to and prunes against the same number.
+     */
+    private class DirectoryBudget {
+
+        /** Canonical bytes as of the last full scan, or [UNKNOWN_TOTAL_BYTES] when stale. */
+        var totalBytes = UNKNOWN_TOTAL_BYTES
+
+        /** Writes accounted for by arithmetic alone since the last full directory scan. */
+        var writesSinceScan = 0
+
+        /** Next access stamp to hand out; see [nextAccessStamp]. */
+        var nextStamp = 0L
+    }
+
+    private val budget = budgetFor(directory)
 
     /**
      * A cache written by an earlier version — or by a build with a larger budget — can already be
@@ -46,27 +72,10 @@ internal class DiskImageCache(
      * rather than in the constructor keeps the directory scan on the disk dispatcher, off whatever
      * thread called `ImageLoader.create()`.
      *
-     * Plain fields, not atomics: every method here runs on [ImageCache]'s single-threaded disk
-     * dispatcher, which both serialises the updates and publishes them between dispatches. An
-     * atomic would suggest a mutual exclusion it could not actually provide across a whole pass.
+     * Per instance rather than per directory: each instance has its own [maxSizeBytes], so a second
+     * one with a smaller budget still has to prune the directory down to *its* limit once.
      */
     private var budgetEnforced = false
-
-    /**
-     * Total canonical bytes as of the last full scan, or [UNKNOWN_TOTAL_BYTES] when a deletion this
-     * class did not account for makes it stale. Only ever used to *skip* a scan, and this instance's
-     * own writes are the only thing that adds bytes to it, so for a single writer a stale value can
-     * be too high — costing a needless scan — but never too low.
-     *
-     * That holds for one instance per directory, which is how the library is built: the loader is
-     * created once per process and owns its cache directory. A second writer over the same
-     * directory would be invisible between scans, so [WRITES_BEFORE_RESCAN] forces one periodically
-     * and keeps any such drift bounded rather than permanent.
-     */
-    private var totalBytes = UNKNOWN_TOTAL_BYTES
-
-    /** Writes accounted for by arithmetic alone since the last full directory scan. */
-    private var writesSinceScan = 0
 
     /**
      * Returns the stored bytes with their original timestamp, or `null` for a miss.
@@ -159,12 +168,17 @@ internal class DiskImageCache(
                 output.write(bytes)
             }
             val target = fileFor(url)
-            // Whatever this write replaces stops counting, so the entry is charged once. Only a
-            // file was ever counted, so only a file may be discounted here.
-            val replacedBytes = if (target.isFile) target.length() else 0L
-            if (!renameIntoPlace(temporary, target)) return
-            touch(target)
-            accountForWrite(addedBytes = entrySizeOf(bytes), replacedBytes = replacedBytes)
+            // Measuring what is replaced, replacing it and charging the difference is one
+            // transaction: two instances writing the same URL would otherwise both measure the old
+            // file and each discount it, leaving the shared total below what is really on disk.
+            synchronized(budget) {
+                // Whatever this write replaces stops counting, so the entry is charged once. Only
+                // a file was ever counted, so only a file may be discounted here.
+                val replacedBytes = if (target.isFile) target.length() else 0L
+                if (!renameIntoPlace(temporary, target)) return
+                touch(target)
+                accountForWrite(addedBytes = entrySizeOf(bytes), replacedBytes = replacedBytes)
+            }
         } catch (failure: IOException) {
             temporary.delete()
         }
@@ -182,10 +196,10 @@ internal class DiskImageCache(
             // met — or it could not be enumerated, in which case entries may still be there and
             // the total must not be assumed to be zero.
             if (directory.exists()) {
-                totalBytes = UNKNOWN_TOTAL_BYTES
+                setTotalBytes(UNKNOWN_TOTAL_BYTES)
             } else {
                 budgetEnforced = true
-                totalBytes = 0L
+                setTotalBytes(0L)
             }
             return
         }
@@ -193,13 +207,13 @@ internal class DiskImageCache(
         // Every file is attempted: a refusal must not stop the ones after it.
         files.forEach { file -> if (!file.delete()) emptied = false }
         if (emptied) {
-            // Nothing is left to sweep or prune, so the budget is trivially enforced from here on.
+            // Nothing is left to prune, so the budget is trivially enforced from here on.
             budgetEnforced = true
-            totalBytes = 0L
+            setTotalBytes(0L)
         } else {
             // Something survived the clear and is still charged to the budget, so the next write
             // has to find out how much rather than assume an empty directory.
-            totalBytes = UNKNOWN_TOTAL_BYTES
+            setTotalBytes(UNKNOWN_TOTAL_BYTES)
         }
     }
 
@@ -212,16 +226,41 @@ internal class DiskImageCache(
     }
 
     /**
-     * Records the access time as ordinary filesystem metadata. Nothing else is written: the 8-byte
+     * Records the access stamp as ordinary filesystem metadata. Nothing else is written: the 8-byte
      * header keeps the original `cachedAtMillis`, so being used never extends an entry's TTL.
      */
     private fun touch(file: File) {
-        file.setLastModified(clock.nowMillis())
+        file.setLastModified(nextAccessStamp(file.lastModified()))
+    }
+
+    /**
+     * The next access stamp, which is never below one already stored in the directory.
+     *
+     * The wall clock alone cannot order accesses: after a rollback a fresh write or a just-served
+     * hit would carry a smaller stamp than entries touched before it and would be evicted first,
+     * exactly inverting the policy. Every scan lifts the counter past the newest stamp it saw, and
+     * so does the entry being touched here — which covers a directory this instance has not managed
+     * to scan — so the order recorded on disk only ever moves forward.
+     */
+    private fun nextAccessStamp(observedStamp: Long): Long = synchronized(budget) {
+        liftPast(observedStamp)
+        val stamp = maxOf(clock.nowMillis(), budget.nextStamp)
+        budget.nextStamp = incremented(stamp)
+        stamp
+    }
+
+    /** Keeps the counter ahead of a stamp already recorded on disk. Call under the budget lock. */
+    private fun liftPast(stamp: Long) {
+        budget.nextStamp = maxOf(budget.nextStamp, incremented(stamp))
     }
 
     /** A deletion this class did not budget for; the next write has to rescan to be sure. */
     private fun dropEntry(file: File) {
-        if (file.delete()) totalBytes = UNKNOWN_TOTAL_BYTES
+        if (file.delete()) setTotalBytes(UNKNOWN_TOTAL_BYTES)
+    }
+
+    private fun setTotalBytes(value: Long) = synchronized(budget) {
+        budget.totalBytes = value
     }
 
     private fun enforceBudgetOnFirstUse() {
@@ -237,81 +276,80 @@ internal class DiskImageCache(
      * disk dispatcher ahead of the reads a scrolling list is waiting for, so the total from the
      * last scan is carried forward and a full pass happens only when the budget is actually at
      * risk — or when the total is unknown because something outside this accounting deleted a file.
+     * The total is shared per directory, so a second cache instance's writes are included rather
+     * than invisible.
      */
     private fun accountForWrite(addedBytes: Long, replacedBytes: Long) {
-        val known = totalBytes
-        if (known != UNKNOWN_TOTAL_BYTES && writesSinceScan < WRITES_BEFORE_RESCAN) {
-            totalBytes = known + addedBytes - replacedBytes
-            if (totalBytes <= maxSizeBytes) {
-                writesSinceScan++
-                return
+        val fits = synchronized(budget) {
+            val known = budget.totalBytes
+            if (known == UNKNOWN_TOTAL_BYTES || budget.writesSinceScan >= WRITES_BEFORE_RESCAN) {
+                false
+            } else {
+                val updated = known + addedBytes - replacedBytes
+                budget.totalBytes = updated
+                if (updated <= maxSizeBytes) {
+                    budget.writesSinceScan++
+                    true
+                } else {
+                    false
+                }
             }
         }
-        pruneToBudget()
+        if (!fits) pruneToBudget()
     }
 
     /**
      * Deletes canonical entries, least recently used first, until they fit [maxSizeBytes].
      *
-     * `lastModified` is the persisted access time and the filename breaks ties, so the order is the
+     * The access stamp is the persisted recency and the filename breaks ties, so the order is the
      * same however the filesystem happens to enumerate the directory. Both are read once into
      * [Entry] rather than re-read during the sort: a file disappearing mid-pass would otherwise
-     * change the sort key underneath the comparator and make it throw. The same walk sweeps stale
-     * write debris, so temporaries too young to touch on one pass are reclaimed by a later one. A
-     * deletion the filesystem
+     * change the sort key underneath the comparator and make it throw. A deletion the filesystem
      * refuses is skipped rather than aborting the pass; if enough of them are refused the cache
      * stays over budget, which is the best-effort half of the contract.
+     *
+     * The whole pass holds the directory's lock, so a second instance over the same directory waits
+     * for it. That coupling is the price of one shared, correct total; with the single instance the
+     * library actually builds, the lock is never contended.
      */
     private fun pruneToBudget() {
-        val entries = scanDirectory()
-        if (entries == null) {
-            // The directory could not be enumerated. It may still hold entries, so the total stays
-            // unknown rather than being reset to zero.
-            totalBytes = if (directory.exists()) UNKNOWN_TOTAL_BYTES else 0L
-            return
-        }
-        var remainingBytes = entries.sumOf { entry -> entry.lengthBytes }
-        if (remainingBytes > maxSizeBytes) {
-            val leastRecentFirst = entries.sortedWith(
-                compareBy<Entry> { entry -> entry.lastModifiedMillis }.thenBy { entry -> entry.file.name },
-            )
-            for (entry in leastRecentFirst) {
-                if (remainingBytes <= maxSizeBytes) break
-                if (entry.file.delete()) remainingBytes -= entry.lengthBytes
+        synchronized(budget) {
+            val entries = canonicalEntries()
+            if (entries == null) {
+                // The directory could not be enumerated. It may still hold entries, so the total
+                // stays unknown rather than being reset to zero.
+                budget.totalBytes = if (directory.exists()) UNKNOWN_TOTAL_BYTES else 0L
+                return
             }
+            entries.forEach { entry -> liftPast(entry.accessStamp) }
+            var remainingBytes = entries.sumOf { entry -> entry.lengthBytes }
+            if (remainingBytes > maxSizeBytes) {
+                val leastRecentFirst = entries.sortedWith(
+                    compareBy<Entry> { entry -> entry.accessStamp }.thenBy { entry -> entry.file.name },
+                )
+                for (entry in leastRecentFirst) {
+                    if (remainingBytes <= maxSizeBytes) break
+                    if (entry.file.delete()) remainingBytes -= entry.lengthBytes
+                }
+            }
+            budget.totalBytes = remainingBytes
+            budget.writesSinceScan = 0
         }
-        totalBytes = remainingBytes
-        writesSinceScan = 0
     }
 
     /**
-     * One walk of the managed directory, returning the entries the budget applies to and removing
-     * write debris on the way past. `null` means the directory could not be enumerated at all.
+     * The entries the budget applies to. `null` means the directory could not be enumerated at all.
      *
-     * The directory also holds HTTP response spools and this cache's own atomic-write temporaries,
-     * which belong to writes that may still be running. Only finished entries — a file whose whole
-     * name is a [CacheKey] digest — are counted or evicted, so pruning can never unlink a transfer
-     * in progress.
-     *
-     * A temporary older than [STALE_TEMPORARY_MILLIS] is different: a write of this size takes
-     * milliseconds, so at that age it can only be what a process that died mid-write left behind.
-     * Nothing counts those bytes, so without this they would sit outside the budget forever;
-     * `HttpImageDownloader` sweeps its own response spools the same way.
+     * The managed directory also holds HTTP response spools and this cache's own atomic-write
+     * temporaries, which belong to writes that may still be running — possibly another instance's,
+     * for however long a large transfer takes. Only finished entries — a file whose whole name is a
+     * [CacheKey] digest — are counted or evicted, so nothing here can unlink a write in progress.
+     * Temporaries are cleaned up by the write that owns them and by `clearCache()`.
      */
-    private fun scanDirectory(): List<Entry>? {
-        val files = directory.listFiles() ?: return null
-        val staleBefore = clock.nowMillis() - STALE_TEMPORARY_MILLIS
-        val entries = mutableListOf<Entry>()
-        for (file in files) {
-            if (!file.isFile) continue
-            if (CANONICAL_NAME.matches(file.name)) {
-                entries += Entry(file, file.length(), file.lastModified())
-            } else if (file.name.startsWith(TEMP_PREFIX) && file.lastModified() < staleBefore) {
-                file.delete()
-            }
-        }
-        return entries
-    }
+    private fun canonicalEntries(): List<Entry>? =
+        directory.listFiles()
+            ?.filter { file -> file.isFile && CANONICAL_NAME.matches(file.name) }
+            ?.map { file -> Entry(file, file.length(), file.lastModified()) }
 
     /** Complete on-disk cost of an entry: the timestamp header plus the encoded bytes. */
     private fun entrySizeOf(bytes: ByteArray): Long = HEADER_BYTES + bytes.size.toLong()
@@ -336,9 +374,27 @@ internal class DiskImageCache(
 
         /** How many writes may be accounted for arithmetically before a full scan is forced. */
         private const val WRITES_BEFORE_RESCAN = 32
-
-        /** Age at which an atomic-write temporary can only be the debris of a dead write. */
-        private const val STALE_TEMPORARY_MILLIS = 60_000L
         private val CANONICAL_NAME = Regex("[0-9a-f]{64}")
+
+        /**
+         * One [DirectoryBudget] per cache directory, so instances over the same directory share the
+         * accounting instead of each keeping a private, incomplete view of it. One small entry per
+         * directory an application caches into — in practice exactly one — kept for the process
+         * lifetime, because a directory used once is likely to be used again.
+         */
+        private val budgets = ConcurrentHashMap<String, DirectoryBudget>()
+
+        /**
+         * Keyed by [File.getAbsolutePath], which is a pure string operation. `canonicalPath` would
+         * resolve symlinks — and would also hit the filesystem from a constructor that must not,
+         * since a loader is built on the caller's thread. Instances are expected to be handed the
+         * same directory, which is what `RealImageLoader.create` does.
+         */
+        private fun budgetFor(directory: File): DirectoryBudget =
+            budgets.getOrPut(directory.absolutePath) { DirectoryBudget() }
+
+        /** Increment that stops at [Long.MAX_VALUE] instead of wrapping into the distant past. */
+        private fun incremented(value: Long): Long =
+            if (value == Long.MAX_VALUE) value else value + 1
     }
 }
