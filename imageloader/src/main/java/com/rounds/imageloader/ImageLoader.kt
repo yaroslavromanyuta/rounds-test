@@ -2,7 +2,9 @@ package com.rounds.imageloader
 
 import android.content.Context
 import android.widget.ImageView
+import androidx.annotation.AnyThread
 import androidx.annotation.DrawableRes
+import androidx.annotation.MainThread
 import com.rounds.imageloader.internal.RealImageLoader
 
 /**
@@ -15,8 +17,11 @@ import com.rounds.imageloader.internal.RealImageLoader
  * Coroutines are an implementation detail — consumers never supply a scope, a dispatcher or a
  * suspending function, which keeps the library equally usable from Java and Kotlin.
  *
- * [load] and [clear] mutate the target view, so call them from the main thread, as with any other
- * view operation. [clearCache] and [invalidate] touch no view and may be called from any thread.
+ * [load] and [clear] mutate the target view before they return, so they are main-thread APIs, as
+ * with any other view operation, and are annotated `@MainThread` for Android Lint. [clearCache] and
+ * [invalidate] touch no view and are `@AnyThread`. The annotations carry the same contract this
+ * documentation states, except that a Java or Kotlin consumer's own static analysis can check it at
+ * the call site instead of the reader having to.
  * An instance is intended to be created once per process and holds no Activity, Fragment or view
  * of its own. Create one with [create].
  */
@@ -31,7 +36,10 @@ interface ImageLoader {
      * empty body or undecodable payload — leave the placeholder in place and never throw.
      *
      * Passing [NO_PLACEHOLDER] behaves exactly like the two-argument [load].
+     *
+     * Main thread: the placeholder is applied to [target] before this returns.
      */
+    @MainThread
     fun load(url: String, @DrawableRes placeholderRes: Int, target: ImageView)
 
     /**
@@ -41,7 +49,10 @@ interface ImageLoader {
      * otherwise keep showing the previous item's image until the new one arrives. Everything else —
      * cancellation of the previous request, stale-result rejection, silent failure handling — is
      * identical to the three-argument [load]; on failure the target simply stays empty.
+     *
+     * Main thread: [target] is emptied before this returns.
      */
+    @MainThread
     fun load(url: String, target: ImageView)
 
     /**
@@ -50,7 +61,10 @@ interface ImageLoader {
      *
      * This is view lifecycle, not storage: it discards work for one `ImageView` and leaves cached
      * images alone. To discard cached images use [clearCache] or [invalidate].
+     *
+     * Main thread: the association is read from and written to [target] before this returns.
      */
+    @MainThread
     fun clear(target: ImageView)
 
     /**
@@ -70,6 +84,7 @@ interface ImageLoader {
      * download replaces them. The same applies if the process dies before the queued deletion runs.
      * This is neither a secure erase nor durable across process death.
      */
+    @AnyThread
     fun clearCache()
 
     /**
@@ -77,6 +92,7 @@ interface ImageLoader {
      * place. Callable from any thread, with the same immediacy, the same in-flight guarantee and
      * the same best-effort, non-durable disk deletion as [clearCache].
      */
+    @AnyThread
     fun invalidate(url: String)
 
     companion object {
