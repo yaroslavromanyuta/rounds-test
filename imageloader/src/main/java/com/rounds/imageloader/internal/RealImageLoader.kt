@@ -82,12 +82,19 @@ internal class RealImageLoader(
         // Memory is emptied and the generation bumped synchronously, so the cache is logically
         // empty the moment this returns; only the file deletion is deferred to the disk dispatcher.
         cache.clear()
-        scope.launch { cache.clearDisk() }
+        // Undispatched so the wrapper runs on the calling thread as far as the disk dispatcher
+        // handoff, which means the deletion is queued before this method returns whichever thread
+        // called it. A plain launch would first post the wrapper to the main dispatcher: an
+        // off-main caller could then return while a load already running on main submits a disk
+        // read ahead of the deletion and is served the stale file. Nothing runs on the caller but
+        // the handoff itself — the filesystem is only ever touched on the disk dispatcher.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) { cache.clearDisk() }
     }
 
     override fun invalidate(url: String) {
         cache.invalidate(url)
-        scope.launch { cache.invalidateOnDisk(url) }
+        // Undispatched for the same submission-ordering reason as clearCache.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) { cache.invalidateOnDisk(url) }
     }
 
     /**
