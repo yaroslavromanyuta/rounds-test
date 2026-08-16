@@ -1,8 +1,6 @@
 package com.rounds.imageloader.cache
 
 import android.graphics.Bitmap
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 
@@ -38,6 +36,21 @@ internal data class CacheSnapshot(val global: Long, val key: Long)
  * 2. **A single-threaded disk dispatcher.** Disk work is FIFO, so a deletion queued by an
  *    invalidation always completes before a read queued after it — a pending delete can never let a
  *    stale file be served.
+ *
+ * Checking the generation and acting on the answer has to be **one transaction**, or the check
+ * proves nothing: a request could pass it, be overtaken by an invalidation, and then store bytes the
+ * invalidation was meant to drop. The two tiers get that guarantee from different mechanisms,
+ * because they are mutated on different threads:
+ *
+ * - **Memory** is mutated synchronously by whichever thread is loading or invalidating, so the check
+ *   and the `put` are performed under [generationLock], the same monitor [invalidate] and [clear]
+ *   hold while they bump a generation and drop entries. Nothing suspends or touches the filesystem
+ *   under that monitor; it is only ever held across an `LruCache` operation.
+ * - **Disk** is mutated only on [diskDispatcher], so the check is performed *inside* the dispatched
+ *   operation that writes, immediately before the write. An invalidation that has already bumped the
+ *   generation is seen by that check; one that has not yet bumped it cannot have submitted its
+ *   deletion either, and since deletion is submitted before the public invalidation call returns,
+ *   that deletion is queued behind this write and still removes what the write stores.
  */
 internal class ImageCache(
     private val memory: MemoryImageCache,
@@ -45,11 +58,19 @@ internal class ImageCache(
     private val diskDispatcher: CoroutineDispatcher,
 ) {
 
-    private val globalGeneration = AtomicLong()
-    private val keyGenerations = ConcurrentHashMap<String, Long>()
+    /**
+     * Guards the generations *and* the memory-cache mutations that depend on them, so a caller can
+     * never observe a generation that another thread has already invalidated by the time it writes.
+     */
+    private val generationLock = Any()
 
-    fun snapshot(url: String): CacheSnapshot =
-        CacheSnapshot(globalGeneration.get(), keyGenerations[url] ?: INITIAL_GENERATION)
+    private var globalGeneration = INITIAL_GENERATION
+    private val keyGenerations = mutableMapOf<String, Long>()
+
+    /** Both halves are read together, so a snapshot is never half of one state and half of another. */
+    fun snapshot(url: String): CacheSnapshot = synchronized(generationLock) {
+        CacheSnapshot(globalGeneration, keyGeneration(url))
+    }
 
     fun getFromMemory(url: String): CachedBitmap? = memory.get(url)
 
@@ -60,21 +81,38 @@ internal class ImageCache(
     /**
      * Stores the bitmap unless the URL was invalidated since [snapshot] was taken.
      *
+     * The check and the store are one transaction against [invalidate] and [clear]: an invalidation
+     * either happens entirely before this call — and is seen by the check — or entirely after it,
+     * and then removes what was stored here. It can never land in between.
+     *
      * [cachedAtMillis] is always the timestamp of the original successful download — on promotion
      * from disk it is the disk entry's own timestamp, never "now".
      */
     fun putInMemory(url: String, bitmap: Bitmap, cachedAtMillis: Long, snapshot: CacheSnapshot) {
-        if (isCurrent(url, snapshot)) memory.put(url, bitmap, cachedAtMillis)
+        synchronized(generationLock) {
+            if (!isCurrent(url, snapshot)) return
+            memory.put(url, bitmap, cachedAtMillis)
+        }
     }
 
+    /**
+     * Stores the encoded bytes unless the URL was invalidated since [snapshot] was taken.
+     *
+     * The check runs on [diskDispatcher] rather than before the switch to it, so the write is
+     * authorised inside the same serialised disk operation that performs it. Deciding earlier would
+     * let an invalidation delete the entry and then be overtaken by this already-authorised write,
+     * resurrecting the bytes it had just removed.
+     */
     suspend fun putOnDisk(
         url: String,
         bytes: ByteArray,
         cachedAtMillis: Long,
         snapshot: CacheSnapshot,
     ) {
-        if (!isCurrent(url, snapshot)) return
-        withContext(diskDispatcher) { disk.write(url, bytes, cachedAtMillis) }
+        withContext(diskDispatcher) {
+            if (!isCurrent(url, snapshot)) return@withContext
+            disk.write(url, bytes, cachedAtMillis)
+        }
     }
 
     /** Drops corrupt bytes only if the on-disk entry is still exactly the one that was decoded. */
@@ -90,10 +128,13 @@ internal class ImageCache(
 
     /** Immediate half of `invalidate(url)`: the URL stops being served from memory at once. */
     fun invalidate(url: String) {
-        // compute rather than get-then-put: the bump has to be atomic, or two concurrent
-        // invalidations of the same url could lose one and leave a snapshot looking current.
-        keyGenerations.compute(url) { _, current -> (current ?: INITIAL_GENERATION) + 1 }
-        memory.remove(url)
+        // Under the lock, so the bump and the removal are one transaction both against another
+        // invalidation — two concurrent ones must not lose a bump and leave a snapshot looking
+        // current — and against a load storing into memory with a pre-invalidation snapshot.
+        synchronized(generationLock) {
+            keyGenerations[url] = keyGeneration(url) + 1
+            memory.remove(url)
+        }
     }
 
     suspend fun invalidateOnDisk(url: String) {
@@ -102,9 +143,11 @@ internal class ImageCache(
 
     /** Immediate half of `clearCache()`: nothing is served from memory afterwards. */
     fun clear() {
-        globalGeneration.incrementAndGet()
-        keyGenerations.clear()
-        memory.clear()
+        synchronized(generationLock) {
+            globalGeneration++
+            keyGenerations.clear()
+            memory.clear()
+        }
     }
 
     suspend fun clearDisk() {
@@ -112,8 +155,12 @@ internal class ImageCache(
     }
 
     private fun isCurrent(url: String, snapshot: CacheSnapshot): Boolean =
-        snapshot.global == globalGeneration.get() &&
-            snapshot.key == (keyGenerations[url] ?: INITIAL_GENERATION)
+        synchronized(generationLock) {
+            snapshot.global == globalGeneration && snapshot.key == keyGeneration(url)
+        }
+
+    /** Call under [generationLock]. */
+    private fun keyGeneration(url: String): Long = keyGenerations[url] ?: INITIAL_GENERATION
 
     private companion object {
         private const val INITIAL_GENERATION = 0L
