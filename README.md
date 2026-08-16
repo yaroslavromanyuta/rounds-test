@@ -52,11 +52,11 @@ Dependency direction:
 
 ```kotlin
 interface ImageLoader {
-    fun load(url: String, @DrawableRes placeholderRes: Int, target: ImageView)
-    fun load(url: String, target: ImageView)
-    fun clear(target: ImageView)      // one view's request
-    fun clearCache()                  // every cached image
-    fun invalidate(url: String)       // one cached image
+    @MainThread fun load(url: String, @DrawableRes placeholderRes: Int, target: ImageView)
+    @MainThread fun load(url: String, target: ImageView)
+    @MainThread fun clear(target: ImageView)      // one view's request
+    @AnyThread  fun clearCache()                  // every cached image
+    @AnyThread  fun invalidate(url: String)       // one cached image
 
     companion object {
         const val NO_PLACEHOLDER: Int = 0
@@ -74,6 +74,8 @@ Three operations are easy to confuse, so they are named apart:
 | `clearCache()` | everything | drops every cached image from memory and disk |
 
 `create(context)` retains only `context.applicationContext` — it needs a cache directory, not an Activity — so passing an Activity is safe.
+
+**Threading is part of the signature, not just the prose.** `load(...)` and `clear(target)` mutate the `ImageView` *before they return* — the placeholder is applied, or the reused target emptied, or the request association dropped, synchronously — so they are ordinary main-thread view calls and are annotated `@MainThread`. Everything after that point is asynchronous, and the decoded bitmap is always delivered back on the main dispatcher. `clearCache()` and `invalidate(url)` touch no view and are annotated `@AnyThread`. Because `androidx.annotation` is an `api` dependency, Java and Kotlin consumers get these annotations on their own compile classpath and Android Lint flags a call from the wrong thread at the call site; nothing throws at runtime, and the synchronous guarantees above are unchanged.
 
 The placeholder is optional. `load(url, target)` loads without one and **empties the target first** — a reused view must not keep showing the previous item's image while the new one arrives. `NO_PLACEHOLDER` is the same thing for callers that compute the resource id and may not have one.
 
@@ -342,7 +344,8 @@ The image-loader tests are deterministic and offline:
 - the decode bound that keeps an oversized image from crashing the host is asserted directly — full-size decoding below the limit, halving above it, powers of two only, and the supplied payload's 11000×7000 record proven to land under the platform's 100MB draw limit;
 - the disk cache runs against a real temporary directory — real files, real atomic renames, real corrupt-file handling — not a mocked filesystem. The 128 MiB budget is asserted with tiny injected budgets: exactly-full is kept, the least recently used entry is evicted, a read moves an entry out of the firing line, equal access times fall back to filename order, a replacement is counted once, an oversized image is stored not at all, an over-budget directory is pruned on the first operation rather than in the constructor, and spools, temporaries, lookalike names and directories survive every pass;
 - `HttpImageDownloader` is exercised against a JDK `HttpServer` on an ephemeral loopback port — real HTTP, no production endpoint, no public image host — including the exact response-size boundary, oversized declared bodies, oversized chunked bodies, and temporary-file cleanup on success and failure;
-- three tests are written in Java to verify the API is usable from Java, including the placeholder-free overload and both cache-invalidation calls.
+- three tests are written in Java to verify the API is usable from Java, including the placeholder-free overload and both cache-invalidation calls;
+- the thread contract is asserted against the *compiled* `ImageLoader`, by reading the `@MainThread`/`@AnyThread` descriptors out of the class file's annotation attributes. AndroidX thread annotations have `CLASS` retention, so a reflection test would see nothing; reading the class file checks what Android Lint actually consumes, and looking each method up by its exact JVM descriptor makes the same test a binary-compatibility guard.
 
 ## Assumptions and trade-offs
 
