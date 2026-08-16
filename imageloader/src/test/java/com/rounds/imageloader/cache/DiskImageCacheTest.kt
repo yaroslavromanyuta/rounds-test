@@ -74,6 +74,23 @@ class DiskImageCacheTest {
     }
 
     @Test
+    fun `an entry stamped in the future is a miss and is deleted`() {
+        // A clock rollback between the write and the read: the file must not outlive the TTL just
+        // because its age looks negative.
+        cache.write(URL_A, BYTES_A, START_MILLIS + ONE_HOUR_MILLIS)
+
+        assertNull(cache.read(URL_A))
+        assertEquals(0, directory.listFiles()?.size)
+    }
+
+    @Test
+    fun `an entry stamped one millisecond in the future is a miss`() {
+        cache.write(URL_A, BYTES_A, START_MILLIS + 1)
+
+        assertNull(cache.read(URL_A))
+    }
+
+    @Test
     fun `reading does not extend the time to live`() {
         cache.write(URL_A, BYTES_A, START_MILLIS)
 

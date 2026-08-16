@@ -68,6 +68,23 @@ class MemoryImageCacheTest {
     }
 
     @Test
+    fun `an entry stamped in the future is a miss and is evicted`() {
+        // A clock rollback between the write and the read: the entry must not outlive the TTL just
+        // because its age looks negative.
+        cache.put(URL_A, bitmap(), START_MILLIS + ONE_HOUR_MILLIS)
+
+        assertNull(cache.get(URL_A))
+        assertEquals(0, cache.sizeBytes())
+    }
+
+    @Test
+    fun `an entry stamped one millisecond in the future is a miss`() {
+        cache.put(URL_A, bitmap(), START_MILLIS + 1)
+
+        assertNull(cache.get(URL_A))
+    }
+
+    @Test
     fun `reading does not extend the time to live`() {
         cache.put(URL_A, bitmap(), START_MILLIS)
 
