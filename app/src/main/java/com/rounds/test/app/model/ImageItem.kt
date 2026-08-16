@@ -1,4 +1,4 @@
-package com.rounds.test.app.presentation.model
+package com.rounds.test.app.model
 
 /**
  * One record of the supplied image list.

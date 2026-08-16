@@ -1,7 +1,7 @@
 package com.rounds.test.app.data.repository
 
 import com.rounds.test.app.data.remote.ImagesRemoteDataSource
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 
 /**
  * Serves the image list from the network.

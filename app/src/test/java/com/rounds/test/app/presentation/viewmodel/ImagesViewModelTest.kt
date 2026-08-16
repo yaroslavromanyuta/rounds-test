@@ -1,7 +1,7 @@
 package com.rounds.test.app.presentation.viewmodel
 
 import com.rounds.test.app.R
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 import com.rounds.test.app.testing.FakeImagesRepository
 import com.rounds.test.app.testing.MainDispatcherRule
 import java.io.IOException

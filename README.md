@@ -255,15 +255,15 @@ com.rounds.test.app
 │   ├── remote/               ImagesRemoteDataSource, HttpImagesRemoteDataSource
 │   │   └── parser/           ImageListJsonParser
 │   └── repository/           ImagesRepository, DefaultImagesRepository
+├── model/                    ImageItem
 └── presentation/
-    ├── model/                ImageItem
     ├── ui/                   MainActivity, ImagesAdapter, ImagesDiffCallback
     └── viewmodel/            ImagesUiState, ImagesViewModel
 ```
 
 Nothing in `:app` is exported, so every type in it except `RoundsApplication` and the Activity is `internal`.
 
-There is one model, not a DTO plus a domain class plus a mapper: the endpoint's two fields are exactly the two the screen shows, and an identical second class would add indirection and no meaning. There is no use case or interactor above the repository either — the repository *is* the boundary the ViewModel is written and tested against.
+There is one model, not a DTO plus a domain class plus a mapper: the endpoint's two fields are exactly the two the screen shows, and an identical second class would add indirection and no meaning. It sits in a top-level `model/` package rather than under `data/` or `presentation/` so that neither layer owns it and the data layer never has to import a presentation type; the package is not called `domain` because there is no business logic or use-case layer to justify the name. There is no use case or interactor above the repository either — the repository *is* the boundary the ViewModel is written and tested against.
 
 Dependency composition is **manual** — no Hilt, Dagger or Koin. `RoundsApplication` creates the single `ImageLoader` and the single `ImagesRepository` and hands them to whatever needs them. The ViewModel is built from `ImagesViewModel.factory(repository)`, a `viewModelFactory { … }` on the ViewModel's companion rather than a class of its own.
 

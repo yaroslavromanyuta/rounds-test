@@ -1,7 +1,7 @@
 package com.rounds.test.app.presentation.viewmodel
 
 import androidx.annotation.StringRes
-import com.rounds.test.app.presentation.model.ImageItem
+import com.rounds.test.app.model.ImageItem
 
 /**
  * Everything the image-list screen needs to render itself, and nothing else — no exceptions, no
