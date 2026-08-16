@@ -15,7 +15,7 @@ Every explicit requirement of the assignment, and where it lives.
 | decodes it | `decode/BitmapFactoryImageDecoder` (`BitmapFactory`) |
 | displays it in the target view | `request/ImageViewTarget` |
 | caches the image | `cache/MemoryImageCache` + `cache/DiskImageCache` |
-| cache valid for exactly 4 hours | `cache/CacheTtl.kt` — `now - cachedAt < 4h`, strict |
+| cache valid for exactly 4 hours | `cache/CacheTtl.kt` — `0 <= now - cachedAt < 4h`, strict |
 | manual cache invalidation | `ImageLoader.clearCache()` and `ImageLoader.invalidate(url)` |
 | uses Kotlin Coroutines | `internal/RealImageLoader`, `internal/InFlightRequestRegistry` |
 | usable from Kotlin | [Kotlin example](#kotlin) |
@@ -174,7 +174,7 @@ The registry is a `ConcurrentHashMap` keyed by URL *and* observed cache generati
 
 Caching is best effort. A write that fails is swallowed and the image is still displayed — a cache problem must not become a UI failure. An entry that is expired, truncated, or whose bytes will not decode is deleted on encounter and treated as a miss.
 
-**TTL — exactly four hours.** An entry is valid while `now - cachedAt < 4h`. At exactly four hours it is **expired**; the comparison is strict. The timestamp is taken once, only after a download *and* a decode both succeed, and the same value goes to both tiers. The TTL is fixed, not sliding: reading never rewrites it, and promoting an entry from disk into memory carries the original timestamp, so a disk hit cannot restart the window.
+**TTL — exactly four hours.** An entry is valid while `0 <= now - cachedAt < 4h`. At exactly four hours it is **expired**; the comparison is strict. The age floor matters as much as the ceiling: an entry stamped in the future — after a clock rollback or from restored cache metadata — would otherwise have a negative age and stay valid until real time caught up, so it is treated as invalid and dropped by whichever tier encounters it. The timestamp is taken once, only after a download *and* a decode both succeed, and the same value goes to both tiers. The TTL is fixed, not sliding: reading never rewrites it, and promoting an entry from disk into memory carries the original timestamp, so a disk hit cannot restart the window.
 
 **Invalidation.** `clearCache()` and `invalidate(url)` empty memory and bump a generation counter synchronously — the cache is logically empty the moment the call returns — while the file deletion runs on the disk dispatcher. A load already in flight when the cache was invalidated still displays its image but is refused when it tries to store it, so it cannot resurrect what was just dropped. All disk work is serialised on a single-threaded dispatcher, so a deletion queued by an invalidation always completes before a read queued after it.
 
@@ -329,7 +329,7 @@ Adapter binding and recycling are not unit-tested. Doing so would mean inflating
 The image-loader tests are deterministic and offline:
 
 - the load pipeline runs on a single `StandardTestDispatcher` with fake downloader/decoder/target, so execution order is controlled by the test rather than by timing — covering placeholder, loading without a placeholder, success, download failure, decode failure, blank URL, request replacement, stale-result rejection, `clear()` and failure isolation between targets;
-- cache behaviour is driven by an injectable `Clock`, never by waiting: the four-hour boundary is asserted at 4h−1ms, exactly 4h and 4h+1ms, and repeated reads are shown not to extend it. Tier ordering (memory hit skips disk and network, disk hit skips the network, expired entries re-download), timestamp preservation on disk→memory promotion, generation-checked corrupt-entry cleanup, "failures are never cached", "a disk write failure still displays the image", and invalidation races are covered too;
+- cache behaviour is driven by an injectable `Clock`, never by waiting: the four-hour boundary is asserted at 4h−1ms, exactly 4h and 4h+1ms, future-dated entries are asserted to be a miss in both tiers, and repeated reads are shown not to extend it. Tier ordering (memory hit skips disk and network, disk hit skips the network, expired entries re-download), timestamp preservation on disk→memory promotion, generation-checked corrupt-entry cleanup, "failures are never cached", "a disk write failure still displays the image", and invalidation races are covered too;
 - concurrency is asserted by download and decode counts rather than by racing threads: three simultaneous loads of one URL produce exactly one download and one decode and paint all three targets; two URLs stay independent; the global limiter admits only its configured number of pipelines and releases permits on cancellation; clearing one consumer mid-flight leaves the others painted; a recycled target still cannot be overwritten by the shared result it used to be waiting for; a failed shared load is retried by the next request; and a load started after `invalidate(url)` or `clearCache()` is shown *not* to join the pre-invalidation work;
 - the in-flight registry is also tested directly, which is where entry release after success/failure, one-of-many consumer cancellation, and cancellation of a 20-entry limiter backlog after every final consumer leaves are provable rather than inferred;
 - the decode bound that keeps an oversized image from crashing the host is asserted directly — full-size decoding below the limit, halving above it, powers of two only, and the supplied payload's 11000×7000 record proven to land under the platform's 100MB draw limit;
@@ -339,7 +339,7 @@ The image-loader tests are deterministic and offline:
 
 ## Assumptions and trade-offs
 
-The assignment fixes the requirements but leaves the design open. The following are **engineering decisions made here**, not literal requirements from the brief: two cache tiers rather than one, in-flight deduplication, response and concurrency limits, per-URL invalidation alongside the mandatory full clear, the injectable `Clock`, and the split into a separate `:imageloader` module.
+The assignment fixes the requirements but leaves the design open. The following are **engineering decisions made here**, not literal requirements from the brief: two cache tiers rather than one, in-flight deduplication, response and concurrency limits, per-URL invalidation alongside the mandatory full clear, the injectable `Clock`, rejecting future-dated cache timestamps, and the split into a separate `:imageloader` module.
 
 - **Placeholder is a `@DrawableRes Int`, optional via a second overload.** A `Drawable` overload adds API surface without demonstrating anything new; the assignment asks for a placeholder resource.
 - **No returned request handle.** `clear(target)` covers the cancellation the assignment needs, and keeps the Java API small.

@@ -125,6 +125,25 @@ class RealImageLoaderCacheTest {
     }
 
     @Test
+    fun `future-dated entries in both tiers cause a fresh download`() = runTest(dispatcher) {
+        // A wall clock rollback after the entries were stored: both tiers are stamped ahead of the
+        // current clock and neither may be served.
+        memory.put(URL_A, bitmapB, START_MILLIS + ONE_HOUR_MILLIS)
+        disk.write(URL_A, BYTES_B, START_MILLIS + ONE_HOUR_MILLIS)
+        downloader.respondWith(URL_A, BYTES_A)
+        decoder.decodeTo(BYTES_A, bitmapA)
+
+        loader.load(target, URL_A, PLACEHOLDER)
+        advanceUntilIdle()
+
+        assertEquals(listOf(URL_A), downloader.requestedUrls)
+        assertEquals(listOf<Bitmap>(bitmapA), target.appliedBitmaps)
+        // The fresh download replaces both future-dated entries with the current timestamp.
+        assertEquals(START_MILLIS, memory.get(URL_A)?.cachedAtMillis)
+        assertArrayEquals(BYTES_A, disk.read(URL_A)?.bytes)
+    }
+
+    @Test
     fun `a disk entry that cannot be decoded falls through to the network`() = runTest(dispatcher) {
         // Stored bytes with no decoder mapping - what a corrupt cache file looks like downstream.
         disk.write(URL_A, BYTES_B, START_MILLIS)
