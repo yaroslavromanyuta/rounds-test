@@ -6,6 +6,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -179,11 +180,334 @@ class DiskImageCacheTest {
         brokenCache.clear()
     }
 
+    @Test
+    fun `the default budget is exactly 128 MiB`() {
+        assertEquals(134_217_728L, DiskImageCache.DEFAULT_MAX_SIZE_BYTES)
+    }
+
+    @Test
+    fun `entries that exactly fill the budget are all kept`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        assertEquals(2 * ENTRY_BYTES, canonicalBytes())
+        assertNotNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `a write past the budget evicts the least recently used entry`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        assertTrue("cache grew past its budget: ${canonicalBytes()}", canonicalBytes() <= 2 * ENTRY_BYTES)
+        assertNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+        assertNotNull(cache.read(URL_C))
+    }
+
+    @Test
+    fun `a read makes an entry the most recently used one`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        // Reading A makes B the oldest, so B is what the next write must evict.
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        assertNotNull(cache.read(URL_A))
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        assertNotNull(cache.read(URL_A))
+        assertNull(cache.read(URL_B))
+        assertNotNull(cache.read(URL_C))
+    }
+
+    @Test
+    fun `entries with the same access time are evicted in file name order`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        // Written without advancing the clock, so both carry the same access time and only the
+        // file name can decide.
+        cache.write(URL_A, payload(), START_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+        val first = listOf(URL_A, URL_B).minByOrNull(CacheKey::of)
+        val second = listOf(URL_A, URL_B).maxByOrNull(CacheKey::of)
+        // If the filesystem had refused the access-time write, the two would differ by however long
+        // the writes took and this would be testing something else.
+        assertEquals(
+            File(directory, CacheKey.of(URL_A)).lastModified(),
+            File(directory, CacheKey.of(URL_B)).lastModified(),
+        )
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        assertNull(cache.read(requireNotNull(first)))
+        assertNotNull(cache.read(requireNotNull(second)))
+    }
+
+    @Test
+    fun `replacing an entry counts only the file that survives`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_A, payload(fill = 'z'.code.toByte()), START_MILLIS)
+
+        // The replacement is one file, not the old one plus the new one, so B survives.
+        assertEquals(2 * ENTRY_BYTES, canonicalBytes())
+        assertArrayEquals(payload(fill = 'z'.code.toByte()), cache.read(URL_A)?.bytes)
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `replacing an entry with a larger one evicts as much as it needs`() {
+        val cache = cacheWithBudget(3 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_A, payload(size = 2 * PAYLOAD_BYTES), START_MILLIS)
+
+        assertTrue("cache grew past its budget: ${canonicalBytes()}", canonicalBytes() <= 3 * ENTRY_BYTES)
+        assertNull(cache.read(URL_B))
+        assertNotNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_C))
+    }
+
+    @Test
+    fun `replacing an entry with a smaller one evicts nothing`() {
+        val cache = cacheWithBudget(3 * ENTRY_BYTES)
+        cache.write(URL_A, payload(size = 2 * PAYLOAD_BYTES), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        assertNotNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `an entry larger than the whole budget is not stored and drops the previous one`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_A, payload(size = 4 * PAYLOAD_BYTES), START_MILLIS)
+
+        // Neither the oversized image nor the previous one may be served as the current entry.
+        assertNull(cache.read(URL_A))
+        assertEquals(0L, canonicalBytes())
+    }
+
+    @Test
+    fun `a cache that is already over budget is pruned on its first operation, not on construction`() {
+        val existing = cacheWithBudget(4 * ENTRY_BYTES)
+        existing.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        existing.write(URL_B, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        existing.write(URL_C, payload(), START_MILLIS)
+
+        // A build with a smaller budget opens the same directory: constructing it must not touch
+        // the filesystem, because construction happens off the disk dispatcher.
+        val shrunk = cacheWithBudget(ENTRY_BYTES)
+        assertEquals(3 * ENTRY_BYTES, canonicalBytes())
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        assertNotNull(shrunk.read(URL_C))
+
+        assertEquals(ENTRY_BYTES, canonicalBytes())
+        assertNull(shrunk.read(URL_A))
+        assertNull(shrunk.read(URL_B))
+    }
+
+    @Test
+    fun `serving an entry does not rewrite its timestamp or extend its time to live`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        clock.advanceBy(3 * ONE_HOUR_MILLIS)
+        assertEquals(START_MILLIS, cache.read(URL_A)?.cachedAtMillis)
+
+        // Four hours after the write, not after the read that made it most recently used.
+        clock.currentMillis = START_MILLIS + CACHE_TTL_MILLIS
+        assertNull(cache.read(URL_A))
+    }
+
+    @Test
+    fun `pruning ignores response spools, unrelated files and directories`() {
+        val spool = temporaryFolder.newFile("image-loader-response-active.tmp")
+        val unrelated = temporaryFolder.newFile("notes.txt")
+        val nested = temporaryFolder.newFolder("0".repeat(64))
+        listOf(spool, unrelated).forEach { file -> file.writeBytes(payload()) }
+        val cache = cacheWithBudget(ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        // Only the canonical entry was evicted; a download still spooling was not touched.
+        assertNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+        assertTrue(spool.isFile)
+        assertTrue(unrelated.isFile)
+        assertTrue(nested.isDirectory)
+    }
+
+    @Test
+    fun `files that only look like cache entries are neither counted nor evicted`() {
+        val lookalikes = listOf(
+            "A".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ).map { name -> File(directory, name).apply { writeBytes(payload()) } }
+        val cache = cacheWithBudget(ENTRY_BYTES)
+
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        assertNotNull(cache.read(URL_A))
+        lookalikes.forEach { file -> assertTrue("evicted ${file.name}", file.isFile) }
+    }
+
+    @Test
+    fun `peeking at an entry does not make it recently used`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        // Inspecting the bytes is not serving them, so A stays the eviction candidate.
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        assertArrayEquals(payload(), cache.peek(URL_A)?.bytes)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        assertNull(cache.read(URL_A))
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `write temporaries left by a dead process are swept on the first operation`() {
+        val orphan = temporaryFolder.newFile("imageloader1234567890.tmp")
+        orphan.writeBytes(payload())
+        assertTrue(orphan.setLastModified(START_MILLIS - ONE_HOUR_MILLIS))
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        assertTrue("swept during construction", orphan.isFile)
+
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        // Excluded from the budget, so nothing else would ever reclaim them.
+        assertFalse(orphan.exists())
+        assertNotNull(cache.read(URL_A))
+    }
+
+    @Test
+    fun `a temporary from a write in progress is not swept`() {
+        val active = temporaryFolder.newFile("imageloader9876543210.tmp")
+        active.writeBytes(payload())
+        assertTrue(active.setLastModified(START_MILLIS))
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+
+        cache.write(URL_A, payload(), START_MILLIS)
+
+        // Another writer may still be filling it; unlinking it would cost that image its entry.
+        assertTrue(active.isFile)
+    }
+
+    @Test
+    fun `a temporary too young to sweep is reclaimed by a later pass`() {
+        val debris = temporaryFolder.newFile("imageloader5555555555.tmp")
+        debris.writeBytes(payload())
+        assertTrue(debris.setLastModified(START_MILLIS))
+        val cache = cacheWithBudget(ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        assertTrue("swept while it could still belong to a live write", debris.isFile)
+
+        // A crash mid-write followed by an immediate restart leaves debris that the first pass has
+        // to leave alone; the next full pass is what reclaims it.
+        clock.advanceBy(2 * ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        assertFalse(debris.exists())
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `clearing the cache resets the budget accounting`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+
+        cache.clear()
+        listOf(URL_C, URL_A, URL_B).forEach { url ->
+            clock.advanceBy(ONE_MINUTE_MILLIS)
+            cache.write(url, payload(), START_MILLIS)
+        }
+
+        assertTrue("cache grew past its budget: ${canonicalBytes()}", canonicalBytes() <= 2 * ENTRY_BYTES)
+        assertNotNull(cache.read(URL_B))
+    }
+
+    @Test
+    fun `a deletion outside the budget accounting is noticed by the next write`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_B, payload(), START_MILLIS)
+        // Android reclaiming the cache directory, or another process deleting a file underneath us.
+        assertTrue(File(directory, CacheKey.of(URL_A)).delete())
+
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        cache.write(URL_C, payload(), START_MILLIS)
+
+        // Two entries fit, so the running total must not have counted the file that vanished.
+        assertNotNull(cache.read(URL_B))
+        assertNotNull(cache.read(URL_C))
+    }
+
+    private fun cacheWithBudget(maxSizeBytes: Long) = DiskImageCache(directory, clock, maxSizeBytes)
+
+    /** Sum of the canonical entry files, which is what the budget applies to. */
+    private fun canonicalBytes(): Long =
+        directory.listFiles()
+            ?.filter { file -> file.isFile && file.name.matches(Regex("[0-9a-f]{64}")) }
+            ?.sumOf { file -> file.length() }
+            ?: 0L
+
+    private fun payload(size: Int = PAYLOAD_BYTES, fill: Byte = 'x'.code.toByte()) =
+        ByteArray(size) { fill }
+
     private companion object {
-        private const val START_MILLIS = 1_000_000L
+        // A recent wall-clock instant, because the LRU tests write it to real file metadata and not
+        // every filesystem can represent a timestamp from 1970.
+        private const val START_MILLIS = 1_700_000_000_000L
         private const val ONE_HOUR_MILLIS = 60L * 60L * 1000L
+        private const val ONE_MINUTE_MILLIS = 60L * 1000L
+        private const val PAYLOAD_BYTES = 64
+        /** What one [payload] costs on disk: the 8-byte timestamp header plus its bytes. */
+        private const val ENTRY_BYTES = 8L + PAYLOAD_BYTES
         private const val URL_A = "https://example.test/a.png"
         private const val URL_B = "https://example.test/b.png"
+        private const val URL_C = "https://example.test/c.png"
         private val BYTES_A = "image-a".toByteArray()
         private val BYTES_B = "image-b-longer".toByteArray()
     }
