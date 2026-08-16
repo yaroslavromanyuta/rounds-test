@@ -147,7 +147,9 @@ class RealImageLoaderConcurrencyTest {
         val executionDispatcher = executor.asCoroutineDispatcher()
         decoder.decodeTo(BYTES_A, bitmapA)
         val productionLimitedLoader = RealImageLoader(
-            cache = ImageCache(memory, disk, executionDispatcher),
+            // Disk work is serialised in production, and the disk cache's bookkeeping relies on it;
+            // only the loader's own work is meant to be parallel here.
+            cache = ImageCache(memory, disk, executionDispatcher.limitedParallelism(1)),
             downloader = blockingDownloader,
             decoder = decoder,
             clock = clock,
