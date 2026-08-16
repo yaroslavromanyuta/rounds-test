@@ -1,18 +1,19 @@
 [versions]
 agp = "9.3.1"
-annotation = "1.9.1"
-collection = "1.1.0"
-coreKtx = "1.10.1"
-coroutines = "1.10.2"
-lifecycle = "2.8.7"
-recyclerview = "1.3.2"
-json = "20240303"
+annotation = "1.10.0"
+collection = "1.6.0"
+coreKtx = "1.19.0"
+coroutines = "1.11.0"
+lifecycle = "2.11.0"
+recyclerview = "1.4.0"
+json = "20260814"
 junit = "4.13.2"
-appcompat = "1.6.1"
-material = "1.10.0"
-mockito = "5.20.0"
-activityKtx = "1.8.0"
-constraintlayout = "2.1.4"
+appcompat = "1.8.0"
+material = "1.14.0"
+mockito = "5.23.0"
+activityKtx = "1.13.0"
+constraintlayout = "2.2.2"
+viewpager2 = "1.1.0"
 
 [libraries]
 androidx-annotation = { group = "androidx.annotation", name = "annotation", version.ref = "annotation" }
@@ -32,6 +33,9 @@ androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 androidx-activity-ktx = { group = "androidx.activity", name = "activity-ktx", version.ref = "activityKtx" }
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+# Constraint only, never a declared dependency: RecyclerView pins ViewPager2 to a pre-release and
+# Material pulls it in, so the graph needs the stable release named explicitly.
+androidx-viewpager2 = { group = "androidx.viewpager2", name = "viewpager2", version.ref = "viewpager2" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -292,7 +292,7 @@ Everything except `ImageLoader` is `internal`. The downloader, decoder and targe
 
 ## Build and run
 
-Requires JDK 25 and the Android SDK (`local.properties` → `sdk.dir`) with Android API 37 installed. Toolchain: AGP 9.3.1, Gradle 9.5, `minSdk 24`, `compileSdk`/`targetSdk` 37, Java 11 bytecode. The Gradle daemon JVM is pinned in `gradle/gradle-daemon-jvm.properties`.
+Requires JDK 25 and the Android SDK (`local.properties` → `sdk.dir`) with Android API 37 installed. Toolchain: AGP 9.3.1, Gradle 9.7, `minSdk 24`, `compileSdk`/`targetSdk` 37, Java 11 bytecode. The Gradle daemon JVM is pinned in `gradle/gradle-daemon-jvm.properties`.
 
 Linux and macOS:
 

@@ -36,6 +36,13 @@ android {
 }
 
 dependencies {
+    constraints {
+        // Nothing here uses ViewPager2 directly. It arrives through Material, and RecyclerView
+        // publishes a constraint pinning it to 1.1.0-beta02, which would put a pre-release
+        // artifact in the resolved graph. 1.1.0 is the stable release of that same line.
+        implementation(libs.androidx.viewpager2)
+    }
+
     implementation(project(":imageloader"))
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.appcompat)
