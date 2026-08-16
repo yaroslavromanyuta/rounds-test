@@ -22,6 +22,14 @@ import java.util.concurrent.ConcurrentHashMap
  * Every method is blocking file I/O and must be called from a background dispatcher — [ImageCache]
  * is what guarantees that.
  *
+ * The directory's lock is the transaction boundary. Reading, judging and then deleting or promoting
+ * an entry, or measuring, replacing and charging one, has to be indivisible: otherwise a decision
+ * taken from one state of the directory could be applied to another, and two instances over one
+ * directory would delete each other's fresh files or lose each other's bytes. So every operation
+ * that touches a canonical file holds that lock for its whole duration, including the file I/O.
+ * With the single instance the library builds, on a single-threaded disk dispatcher, the lock is
+ * never contended; two instances over one directory work correctly but share one disk pipeline.
+ *
  * Caching is best effort: a failure to write, read or delete never propagates to the caller, since
  * a cache problem must not turn a successfully downloaded image into a UI failure. Budget pruning
  * inherits that: if the filesystem refuses a deletion the cache may stay over budget rather than
@@ -86,7 +94,11 @@ internal class DiskImageCache(
      * A hit is the other half of the LRU signal: only an entry that was actually served becomes the
      * most recently used one. A miss, an invalid entry or a failed read never does.
      */
-    fun read(url: String): CachedBytes? {
+    fun read(url: String): CachedBytes? = synchronized(budget) {
+        // Reading, judging and then deleting or promoting is one transaction. Split up, a decision
+        // taken here could be applied to a file another instance has meanwhile replaced: the
+        // deletion would take the fresh entry, and the promotion would stamp it with a recency
+        // allocated before it existed.
         enforceBudgetOnFirstUse()
         val file = fileFor(url)
         if (!file.isFile) return null
@@ -148,14 +160,18 @@ internal class DiskImageCache(
      * write neither promotes nor evicts anything.
      */
     fun write(url: String, bytes: ByteArray, cachedAtMillis: Long) {
-        enforceBudgetOnFirstUse()
-        if (!directory.isDirectory && !directory.mkdirs()) return
-        if (entrySizeOf(bytes) > maxSizeBytes) {
-            // Larger than the whole cache is allowed to be. Storing it would either blow the budget
-            // or be evicted immediately, and keeping the previous entry for this URL would leave a
-            // stale image where the caller believes the new one was cached.
-            remove(url)
-            return
+        synchronized(budget) {
+            enforceBudgetOnFirstUse()
+            if (!directory.isDirectory && !directory.mkdirs()) return
+            if (entrySizeOf(bytes) > maxSizeBytes) {
+                // Larger than the whole cache is allowed to be. Storing it would either blow the
+                // budget or be evicted immediately, and keeping the previous entry for this URL
+                // would leave a stale image where the caller believes the new one was cached.
+                // Judging the size and dropping the old entry is one transaction, so a valid entry
+                // another instance stored meanwhile is not what gets deleted.
+                remove(url)
+                return
+            }
         }
         val temporary = try {
             File.createTempFile(TEMP_PREFIX, null, directory)
@@ -184,12 +200,32 @@ internal class DiskImageCache(
         }
     }
 
-    fun remove(url: String) {
+    /**
+     * Deletes the entry for [url] only while it still holds exactly [expected].
+     *
+     * The comparison and the deletion are one transaction, so a replacement written between them —
+     * by another request, or by another instance over the same directory — is never the file that
+     * gets removed. Used to drop bytes that turned out not to be a decodable image.
+     */
+    fun removeIfUnchanged(url: String, expected: CachedBytes) = synchronized(budget) {
+        val current = peek(url) ?: return
+        if (
+            current.cachedAtMillis == expected.cachedAtMillis &&
+            current.bytes.contentEquals(expected.bytes)
+        ) {
+            remove(url)
+        }
+    }
+
+    fun remove(url: String) = synchronized(budget) {
         enforceBudgetOnFirstUse()
         dropEntry(fileFor(url))
     }
 
-    fun clear() {
+    fun clear() = synchronized(budget) {
+        // Enumerating, deleting and resetting the total is one transaction: a write completing in
+        // between would be charged to a total this call is about to overwrite with zero, and the
+        // directory would then be allowed to grow past the budget by that much.
         val files = directory.listFiles()
         if (files == null) {
             // Either there is no directory yet — nothing is stored, so the budget is trivially
@@ -219,7 +255,10 @@ internal class DiskImageCache(
 
     private fun renameIntoPlace(temporary: File, target: File): Boolean {
         if (temporary.renameTo(target)) return true
-        target.delete()
+        // Windows refuses a rename onto an existing file, so the old one is removed and the rename
+        // retried. If that retry fails too, those bytes are gone while the total still counts them,
+        // so the total has to be treated as stale.
+        if (target.delete()) budget.totalBytes = UNKNOWN_TOTAL_BYTES
         if (temporary.renameTo(target)) return true
         temporary.delete()
         return false
@@ -308,9 +347,7 @@ internal class DiskImageCache(
      * refuses is skipped rather than aborting the pass; if enough of them are refused the cache
      * stays over budget, which is the best-effort half of the contract.
      *
-     * The whole pass holds the directory's lock, so a second instance over the same directory waits
-     * for it. That coupling is the price of one shared, correct total; with the single instance the
-     * library actually builds, the lock is never contended.
+     * Call under the directory's lock, like every other operation that touches canonical files.
      */
     private fun pruneToBudget() {
         synchronized(budget) {

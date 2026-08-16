@@ -81,15 +81,10 @@ internal class ImageCache(
     suspend fun dropDiskEntry(url: String, expected: CachedBytes, snapshot: CacheSnapshot) {
         withContext(diskDispatcher) {
             if (!isCurrent(url, snapshot)) return@withContext
-            // peek, not read: confirming a corrupt entry's identity must not make it the most
-            // recently used file and let it outlive good entries under the disk budget.
-            val current = disk.peek(url) ?: return@withContext
-            if (
-                current.cachedAtMillis == expected.cachedAtMillis &&
-                current.bytes.contentEquals(expected.bytes)
-            ) {
-                disk.remove(url)
-            }
+            // The identity check and the deletion belong together, and neither may promote the
+            // entry: confirming that a corrupt file is still there must not make it the most
+            // recently used one and let it outlive good entries under the disk budget.
+            disk.removeIfUnchanged(url, expected)
         }
     }
 

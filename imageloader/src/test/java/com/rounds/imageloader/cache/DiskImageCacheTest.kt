@@ -2,6 +2,10 @@ package com.rounds.imageloader.cache
 
 import com.rounds.imageloader.testing.FakeClock
 import java.io.File
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -517,6 +521,96 @@ class DiskImageCacheTest {
         assertNotNull(cache.read(URL_C))
     }
 
+    @Test
+    fun `a stale drop cannot delete a replacement written by another cache`() {
+        val first = cacheWithBudget(2 * ENTRY_BYTES)
+        val second = cacheWithBudget(2 * ENTRY_BYTES)
+        first.write(URL_A, payload(), START_MILLIS)
+        val undecodable = requireNotNull(first.peek(URL_A))
+
+        // The replacement lands between the decode failure and the cleanup it triggered.
+        clock.advanceBy(ONE_MINUTE_MILLIS)
+        second.write(URL_A, payload(fill = 'z'.code.toByte()), START_MILLIS)
+        first.removeIfUnchanged(URL_A, undecodable)
+
+        assertArrayEquals(payload(fill = 'z'.code.toByte()), second.read(URL_A)?.bytes)
+    }
+
+    @Test
+    fun `dropping bytes that are still the stored ones removes the entry`() {
+        val cache = cacheWithBudget(2 * ENTRY_BYTES)
+        cache.write(URL_A, payload(), START_MILLIS)
+        val stored = requireNotNull(cache.peek(URL_A))
+
+        cache.removeIfUnchanged(URL_A, stored)
+
+        assertNull(cache.read(URL_A))
+        assertEquals(0L, canonicalBytes())
+    }
+
+    @Test
+    fun `concurrent writes and clears from two caches stay inside the budget`() {
+        val caches = listOf(cacheWithBudget(4 * ENTRY_BYTES), cacheWithBudget(4 * ENTRY_BYTES))
+        val urls = List(8) { index -> "https://example.test/concurrent-$index.png" }
+
+        runConcurrently { worker ->
+            val cache = caches[worker % caches.size]
+            repeat(ROUNDS) { round ->
+                // Clearing never happens on the last round, so every worker finishes on a write and
+                // an empty directory cannot make the assertion below pass by default.
+                if (round % 8 == 7 && round != ROUNDS - 1) cache.clear()
+                cache.write(urls[(worker + round) % urls.size], payload(), START_MILLIS)
+                cache.read(urls[round % urls.size])
+            }
+        }
+
+        // Whatever order the two instances interleaved in, the directory they share is bounded.
+        assertTrue("nothing was cached, so the bound proves nothing", canonicalBytes() > 0)
+        assertTrue("cache grew past its budget: ${canonicalBytes()}", canonicalBytes() <= 4 * ENTRY_BYTES)
+    }
+
+    @Test
+    fun `a concurrent reader cannot overwrite a newer access stamp with an older one`() {
+        val caches = listOf(cacheWithBudget(8 * ENTRY_BYTES), cacheWithBudget(8 * ENTRY_BYTES))
+        val urls = List(4) { index -> "https://example.test/touched-$index.png" }
+        urls.forEach { url ->
+            caches[0].write(url, payload(), START_MILLIS)
+            clock.advanceBy(ONE_MINUTE_MILLIS)
+        }
+        // The newest stamp any reader ever saw on disk for each URL.
+        val highWaterMarks = urls.associateWith { AtomicLong() }
+
+        runConcurrently { worker ->
+            val cache = caches[worker % caches.size]
+            repeat(ROUNDS) { round ->
+                val url = urls[(worker + round) % urls.size]
+                assertNotNull(cache.read(url))
+                val stamp = File(directory, CacheKey.of(url)).lastModified()
+                requireNotNull(highWaterMarks[url]).accumulateAndGet(stamp, ::maxOf)
+            }
+        }
+
+        // Allocating a stamp and writing it are one transaction, so recency cannot go backwards: a
+        // slower reader must not land its older stamp on top of one a peer already recorded.
+        urls.forEach { url ->
+            val stamp = File(directory, CacheKey.of(url)).lastModified()
+            val seen = requireNotNull(highWaterMarks[url]).get()
+            assertTrue("recency went backwards for $url: $stamp after $seen", stamp >= seen)
+        }
+    }
+
+    /** Runs [work] on four threads at once and rethrows whatever any of them threw. */
+    private fun runConcurrently(work: (worker: Int) -> Unit) {
+        val executor = Executors.newFixedThreadPool(WORKERS)
+        try {
+            executor.invokeAll(List(WORKERS) { worker -> Callable { work(worker) } })
+                .forEach { future -> future.get(30, TimeUnit.SECONDS) }
+        } finally {
+            executor.shutdown()
+        }
+        assertTrue("workers did not finish", executor.awaitTermination(30, TimeUnit.SECONDS))
+    }
+
     private fun cacheWithBudget(maxSizeBytes: Long) = DiskImageCache(directory, clock, maxSizeBytes)
 
     /** Sum of the canonical entry files, which is what the budget applies to. */
@@ -536,6 +630,8 @@ class DiskImageCacheTest {
         private const val ONE_HOUR_MILLIS = 60L * 60L * 1000L
         private const val ONE_MINUTE_MILLIS = 60L * 1000L
         private const val PAYLOAD_BYTES = 64
+        private const val WORKERS = 4
+        private const val ROUNDS = 24
         /** What one [payload] costs on disk: the 8-byte timestamp header plus its bytes. */
         private const val ENTRY_BYTES = 8L + PAYLOAD_BYTES
         private const val URL_A = "https://example.test/a.png"
