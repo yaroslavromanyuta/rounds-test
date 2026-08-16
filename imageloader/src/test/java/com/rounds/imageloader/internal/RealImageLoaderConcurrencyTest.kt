@@ -4,17 +4,27 @@ import android.graphics.Bitmap
 import com.rounds.imageloader.cache.DiskImageCache
 import com.rounds.imageloader.cache.ImageCache
 import com.rounds.imageloader.cache.MemoryImageCache
+import com.rounds.imageloader.network.ImageDownloader
+import com.rounds.imageloader.request.Target
+import com.rounds.imageloader.request.TargetRequest
 import com.rounds.imageloader.testing.FakeClock
 import com.rounds.imageloader.testing.FakeImageDecoder
 import com.rounds.imageloader.testing.FakeImageDownloader
 import com.rounds.imageloader.testing.FakeTarget
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -66,6 +76,106 @@ class RealImageLoaderConcurrencyTest {
         assertEquals(listOf(URL_A), downloader.requestedUrls)
         assertEquals(1, decoder.decodeCount)
         targets.forEach { assertEquals(listOf<Bitmap>(bitmapA), it.appliedBitmaps) }
+    }
+
+    @Test
+    fun `a network miss runs through the global load limiter`() = runTest(dispatcher) {
+        scriptSuccess(URL_A, BYTES_A, bitmapA)
+        val recordingLimiter = RecordingLoadLimiter()
+        val limitedLoader = RealImageLoader(
+            cache = ImageCache(memory, disk, dispatcher),
+            downloader = downloader,
+            decoder = decoder,
+            clock = clock,
+            ioDispatcher = dispatcher,
+            mainDispatcher = dispatcher,
+            loadLimiter = recordingLimiter,
+        )
+
+        limitedLoader.load(FakeTarget(), URL_A, PLACEHOLDER)
+        advanceUntilIdle()
+
+        assertEquals(2, recordingLimiter.calls)
+    }
+
+    @Test
+    fun `a disk hit runs through the global load limiter`() = runTest(dispatcher) {
+        disk.write(URL_A, BYTES_A, START_MILLIS)
+        decoder.decodeTo(BYTES_A, bitmapA)
+        val recordingLimiter = RecordingLoadLimiter()
+        val limitedLoader = RealImageLoader(
+            cache = ImageCache(memory, disk, dispatcher),
+            downloader = downloader,
+            decoder = decoder,
+            clock = clock,
+            ioDispatcher = dispatcher,
+            mainDispatcher = dispatcher,
+            loadLimiter = recordingLimiter,
+        )
+
+        limitedLoader.load(FakeTarget(), URL_A, PLACEHOLDER)
+        advanceUntilIdle()
+
+        assertEquals(1, recordingLimiter.calls)
+        assertTrue(downloader.requestedUrls.isEmpty())
+    }
+
+    @Test
+    fun `production loader admits only two distinct cache misses at once`() {
+        val firstTwoEntered = CountDownLatch(2)
+        val thirdEntered = CountDownLatch(1)
+        val allTargetsRendered = CountDownLatch(3)
+        val releaseDownloads = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val activeDownloads = AtomicInteger()
+        val highestActiveDownloads = AtomicInteger()
+        val blockingDownloader = object : ImageDownloader {
+            override fun download(url: String): ByteArray {
+                val call = calls.incrementAndGet()
+                val active = activeDownloads.incrementAndGet()
+                highestActiveDownloads.accumulateAndGet(active, ::maxOf)
+                if (call <= 2) firstTwoEntered.countDown() else thirdEntered.countDown()
+                try {
+                    check(releaseDownloads.await(5, TimeUnit.SECONDS))
+                    return BYTES_A
+                } finally {
+                    activeDownloads.decrementAndGet()
+                }
+            }
+        }
+        val executor = Executors.newFixedThreadPool(6)
+        val executionDispatcher = executor.asCoroutineDispatcher()
+        decoder.decodeTo(BYTES_A, bitmapA)
+        val productionLimitedLoader = RealImageLoader(
+            cache = ImageCache(memory, disk, executionDispatcher),
+            downloader = blockingDownloader,
+            decoder = decoder,
+            clock = clock,
+            ioDispatcher = executionDispatcher,
+            mainDispatcher = executionDispatcher,
+        )
+        try {
+            listOf(URL_A, URL_B, URL_C).forEach { url ->
+                productionLimitedLoader.load(CountingTarget(allTargetsRendered), url, PLACEHOLDER)
+            }
+
+            assertTrue(firstTwoEntered.await(5, TimeUnit.SECONDS))
+            assertFalse(
+                "the third miss must wait for a permit",
+                thirdEntered.await(1, TimeUnit.SECONDS),
+            )
+            assertEquals(2, highestActiveDownloads.get())
+
+            releaseDownloads.countDown()
+            assertTrue(allTargetsRendered.await(5, TimeUnit.SECONDS))
+            assertEquals(3, calls.get())
+            assertEquals(2, highestActiveDownloads.get())
+        } finally {
+            releaseDownloads.countDown()
+            productionLimitedLoader.shutdown()
+            executionDispatcher.close()
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS))
+        }
     }
 
     @Test
@@ -260,12 +370,39 @@ class RealImageLoaderConcurrencyTest {
         decoder.decodeTo(bytes, bitmap)
     }
 
+    private class RecordingLoadLimiter : LoadLimiter {
+        var calls: Int = 0
+            private set
+
+        override suspend fun <T> run(block: suspend () -> T): T {
+            calls++
+            return block()
+        }
+    }
+
+    private class CountingTarget(private val rendered: CountDownLatch) : Target {
+        private val request = AtomicReference<TargetRequest?>()
+
+        override fun setPlaceholder(resId: Int) = Unit
+
+        override fun setBitmap(bitmap: Bitmap) {
+            rendered.countDown()
+        }
+
+        override fun currentRequest(): TargetRequest? = request.get()
+
+        override fun setCurrentRequest(request: TargetRequest?) {
+            this.request.set(request)
+        }
+    }
+
     private companion object {
         private const val PLACEHOLDER = 4242
         private const val START_MILLIS = 1_000_000L
         private const val MEMORY_BYTES = 8 * 1024 * 1024
         private const val URL_A = "https://example.test/a.png"
         private const val URL_B = "https://example.test/b.png"
+        private const val URL_C = "https://example.test/c.png"
         private val BYTES_A = "image-a".toByteArray()
         private val BYTES_B = "image-b".toByteArray()
         private val bitmapA: Bitmap = mock(Bitmap::class.java)

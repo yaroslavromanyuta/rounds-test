@@ -3,6 +3,8 @@ package com.rounds.imageloader.internal
 import android.graphics.Bitmap
 import com.rounds.imageloader.cache.CacheSnapshot
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -14,71 +16,88 @@ import kotlinx.coroutines.async
  *
  * The cache generation is part of the identity, not just the URL: a load that starts after
  * `invalidate(url)` or `clearCache()` observed a different cache state, and must not be served by
- * work that started before it — that would quietly undo the invalidation the caller just asked for.
+ * work that started before it.
  */
 internal data class InFlightKey(val url: String, val cacheGeneration: CacheSnapshot)
 
 /**
- * Keeps one shared operation per [InFlightKey] so concurrent cache misses for the same image
- * download and decode it once.
+ * Keeps one shared operation per [InFlightKey] while at least one target request is subscribed.
  *
- * The shared unit is the *image-producing operation*, not the target request. Each target keeps its
- * own token, placeholder, cancellation and stale-result check, and merely awaits the result:
- *
- * ```text
- * loader scope
- *    └── shared load A
- *
- * target request #1 ──await──┐
- *                            ├── shared load A
- * target request #2 ──await──┘
- * ```
- *
- * Operations are launched in [scope] — the loader's own, long-lived scope — never as a child of the
- * consumer that happened to create them. Awaiting establishes no parent/child link, so cancelling
- * one consumer cancels only that consumer's wait; work another consumer still needs survives.
- *
- * Synchronisation is a [ConcurrentHashMap] rather than a `Mutex`: `computeIfAbsent` makes
- * lookup-or-create atomic, and the two-argument `remove` makes cleanup atomic and identity-checked
- * without needing a coroutine to take a lock from a completion handler. Only registry bookkeeping
- * is ever synchronised — the coroutine is created lazily and started outside the map operation, so
- * no download or decode runs while the map is held, and distinct keys never serialise.
+ * Operations run in the loader-owned [scope]. Cancelling one consumer only releases that
+ * subscription; the operation survives while another consumer remains. Releasing the final
+ * subscription removes and cancels the operation, so recycled targets cannot leave an unbounded
+ * backlog waiting for a load-limiter permit.
  */
 internal class InFlightRequestRegistry(private val scope: CoroutineScope) {
 
-    private val inFlight = ConcurrentHashMap<InFlightKey, Deferred<Bitmap?>>()
+    private class SharedOperation(
+        val deferred: Deferred<Bitmap?>,
+        val consumers: AtomicInteger = AtomicInteger(1),
+    )
+
+    internal class Subscription(
+        private val deferred: Deferred<Bitmap?>,
+        private val releaseAction: () -> Unit,
+    ) {
+        private val released = AtomicBoolean()
+
+        suspend fun await(): Bitmap? = deferred.await()
+
+        fun release() {
+            if (released.compareAndSet(false, true)) releaseAction()
+        }
+
+        val isActive: Boolean
+            get() = deferred.isActive
+    }
+
+    private val inFlight = ConcurrentHashMap<InFlightKey, SharedOperation>()
 
     /**
-     * Returns the operation producing the image for [key], starting one from [produce] if none is
-     * running. [produce] is ignored when an existing operation is joined — every caller for a given
-     * key observed the same cache state, so their producers are interchangeable by construction.
+     * Subscribes to the operation for [key], creating it from [produce] when necessary.
      *
-     * The result is `null` when the image could not be produced. Failures are deliberately not
-     * propagated to consumers as exceptions: a failed shared load is the same outcome as an
-     * undecodable payload, and turning it into a throw would make one consumer's error handling
-     * depend on whether it created the operation or joined it.
+     * [Subscription.release] must run in a `finally` block. Failures become a `null` result so one
+     * consumer's error handling never depends on whether it created or joined the operation.
      */
-    fun sharedLoad(key: InFlightKey, produce: suspend () -> Bitmap?): Deferred<Bitmap?> {
-        var created: Deferred<Bitmap?>? = null
-        val shared = inFlight.computeIfAbsent(key) {
-            scope.async(start = CoroutineStart.LAZY) {
-                try {
-                    produce()
-                } catch (cancellation: CancellationException) {
-                    throw cancellation
-                } catch (failure: Exception) {
-                    // Same failures the single-request path already tolerates: I/O error,
-                    // non-success status, empty body, undecodable payload.
-                    null
-                }
-            }.also { created = it }
+    fun sharedLoad(key: InFlightKey, produce: suspend () -> Bitmap?): Subscription {
+        var created: SharedOperation? = null
+        val operation = inFlight.compute(key) { _, existing ->
+            if (existing != null) {
+                existing.consumers.incrementAndGet()
+                existing
+            } else {
+                SharedOperation(
+                    deferred = scope.async(start = CoroutineStart.LAZY) {
+                        try {
+                            produce()
+                        } catch (cancellation: CancellationException) {
+                            throw cancellation
+                        } catch (failure: Exception) {
+                            null
+                        }
+                    },
+                ).also { created = it }
+            }
+        } ?: error("compute must return an operation")
+
+        created?.deferred?.invokeOnCompletion { inFlight.remove(key, operation) }
+        operation.deferred.start()
+        return Subscription(operation.deferred) { release(key, operation) }
+    }
+
+    private fun release(key: InFlightKey, operation: SharedOperation) {
+        var cancelOperation = false
+        inFlight.computeIfPresent(key) { _, current ->
+            if (current !== operation) {
+                current
+            } else if (operation.consumers.decrementAndGet() == 0) {
+                cancelOperation = true
+                null
+            } else {
+                operation
+            }
         }
-        // Only the creator registers cleanup, and removal is identity-checked, so a late completion
-        // can never evict a newer entry that has already taken this key. Registered before the
-        // operation can run - it is started below - so no completion is missed.
-        created?.invokeOnCompletion { inFlight.remove(key, shared) }
-        shared.start()
-        return shared
+        if (cancelOperation) operation.deferred.cancel()
     }
 
     /** Number of operations currently registered. Exists so tests can prove entries are released. */
