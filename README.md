@@ -281,21 +281,36 @@ Everything except `ImageLoader` is `internal`. The downloader, decoder and targe
 
 ## Build and run
 
-Requires the Android SDK (`local.properties` → `sdk.dir`). Toolchain: AGP 9.3.1, Gradle 9.5, `minSdk 24`, `compileSdk`/`targetSdk` 37, Java 11 bytecode. The Gradle daemon runs on Java 25 (`gradle/gradle-daemon-jvm.properties`).
+Requires JDK 25 and the Android SDK (`local.properties` → `sdk.dir`) with Android API 37 installed. Toolchain: AGP 9.3.1, Gradle 9.5, `minSdk 24`, `compileSdk`/`targetSdk` 37, Java 11 bytecode. The Gradle daemon JVM is pinned in `gradle/gradle-daemon-jvm.properties`.
+
+Linux and macOS:
+
+```shell
+./gradlew assembleDebug     # build the debug APK
+./gradlew installDebug      # install on a connected device/emulator
+```
+
+Windows:
 
 ```powershell
-.\gradlew.bat assembleDebug     # build the debug APK
-.\gradlew.bat installDebug      # install on a connected device/emulator
+.\gradlew.bat assembleDebug
+.\gradlew.bat installDebug
 ```
 
 ## Tests and checks
 
-```powershell
-.\gradlew.bat test                          # JVM unit tests (all modules)
-.\gradlew.bat :imageloader:testDebugUnitTest  # image-loader tests only
-.\gradlew.bat :app:testDebugUnitTest        # sample app tests only
-.\gradlew.bat lint                          # Android Lint
+Linux and macOS:
+
+```shell
+./gradlew test                            # JVM unit tests (all modules)
+./gradlew :imageloader:testDebugUnitTest  # image-loader tests only
+./gradlew :app:testDebugUnitTest          # sample app tests only
+./gradlew lint                            # Android Lint
 ```
+
+Windows uses the same tasks through `gradlew.bat`, for example `.\gradlew.bat test`.
+
+Every push to `main` and every pull request targeting `main` runs `test`, `lint`, and `assembleDebug` in GitHub Actions.
 
 Everything is a JVM unit test — there is no instrumented source set. The Android-framework types this project actually needs to exercise (`Bitmap`, `ImageView`) sit behind small internal seams instead, so the interesting logic runs on the JVM in milliseconds; see the trade-offs below.
 
