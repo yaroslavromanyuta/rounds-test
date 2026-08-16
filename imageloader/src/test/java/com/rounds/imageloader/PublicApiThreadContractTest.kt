@@ -111,7 +111,9 @@ private class ClassFile(val methods: List<Method>) {
 
         fun of(type: Class<*>): ClassFile {
             val resource = type.name.replace('.', '/') + ".class"
-            val bytes = checkNotNull(type.classLoader.getResourceAsStream(resource)) {
+            // Class.getResourceAsStream rather than the class loader's: the loader is nullable for
+            // a bootstrap-loaded class, and an absolute name resolves the same way regardless.
+            val bytes = checkNotNull(type.getResourceAsStream("/$resource")) {
                 "$resource is not on the test classpath"
             }.use { it.readBytes() }
             return read(bytes)
